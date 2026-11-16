@@ -108,12 +108,15 @@ fn render_row(row: &crate::store::StickerRecord) -> String {
 /// never the least-bad rows — the contract promises her that an unsuccessful
 /// search means the sticker is not there, and search must not contradict it.
 ///
-/// `recent` (hashes this group just sent) re-ranks but never hides: the
-/// threshold and the returned score stay the true match score, while the
-/// sort key is damped by [`crate::memory::stickers::RECENT_SEND_DAMPING`],
-/// the same penalty the server-side preselection applies. A repeat stays
-/// findable when it is the only thing that fits; it just stops winning by
-/// default.
+/// `recent` (this group's recent sends, newest window last
+/// [`crate::app::turn::stickers::RECENT_SEND_SCAN_LIMIT`], duplicates
+/// kept) re-ranks but never hides: the threshold and the returned score
+/// stay the true match score, while the sort key is the raw score after
+/// the A6 frequency divisor ([`crate::memory::stickers::divide_by_usage`]
+/// over the hash's count in `recent`), the same ranking the server-side
+/// preselection applies. A repeat stays findable when it is the only
+/// thing that fits; it just stops winning by default — and the more the
+/// group has used it, the harder it has to win.
 pub fn top_matches(
     query: &str,
     rows: Vec<crate::store::StickerRecord>,
@@ -125,10 +128,8 @@ pub fn top_matches(
         .into_iter()
         .map(|row| {
             let raw = crate::memory::stickers::score_text(query, &row.text());
-            let sort_key = match recent.iter().any(|hash| hash == &row.hash) {
-                true => raw * crate::memory::stickers::RECENT_SEND_DAMPING,
-                false => raw,
-            };
+            let sends = recent.iter().filter(|hash| *hash == &row.hash).count() as i64;
+            let sort_key = crate::memory::stickers::divide_by_usage(raw, sends);
             (raw, sort_key, row)
         })
         .filter(|(raw, _, _)| crate::memory::stickers::match_tier(*raw).is_some())
@@ -211,7 +212,7 @@ pub async fn call_search(
             "isError": false
         });
     }
-    // What this group just sent, for the shared recent-send damping in
+    // What this group recently sent, for the shared frequency divisor in
     // `top_matches`. A lookup failure degrades to "nothing recent": search
     // must not fail a turn over a worse ranking.
     let recent: Vec<String> = match group_id {
@@ -417,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_recently_sent_hit_ranks_below_an_equal_fresh_one() {
-        // Identical rows: without damping the hash tiebreak puts "aaa"
+        // Identical rows: without the divisor the hash tiebreak puts "aaa"
         // first. With "aaa" in the group's recent sends, the fresh row
         // wins the sort — while both keep their true (equal) scores, so
         // the repeat is demoted, never hidden or mislabelled.
@@ -431,6 +432,27 @@ mod tests {
         assert_eq!(hits[0].1.hash, "zzz");
         assert_eq!(hits[1].1.hash, "aaa");
         assert_eq!(hits[0].0, hits[1].0);
+    }
+
+    #[test]
+    fn more_frequent_recent_sends_rank_lower() {
+        // Equal matches: "aaa" went out three times inside the window,
+        // "zzz" once. The old flat quarter-weight damping tied them and
+        // the hash tiebreak put "aaa" first; the frequency divisor must
+        // rank the less-used one higher.
+        let recent: Vec<String> = ["aaa", "aaa", "aaa", "zzz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hits = top_matches(
+            "相同",
+            vec![row("aaa", "相同", ""), row("zzz", "相同", "")],
+            5,
+            &recent,
+        );
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].1.hash, "zzz");
+        assert_eq!(hits[1].1.hash, "aaa");
     }
 
     #[test]

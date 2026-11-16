@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use nix::sys::signal::{Signal, kill as send_signal, killpg};
+use crate::process::group::OwnedProcessGroup;
+#[cfg(unix)]
+use nix::sys::signal::{Signal, kill as send_signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -107,7 +109,12 @@ pub const DB_SCAN_LIMIT: usize = 8;
 
 /// An active turn whose step stream has not changed for this long, while the
 /// screen shows no idle prompt, is treated as a crash.
-pub const ACTIVE_STALL: Duration = Duration::from_secs(60);
+///
+/// 120s since 2026-11-12: at 60s, upstream-slow stretches (single model
+/// steps legitimately silent for over a minute) were executed as crashes
+/// in bulk — 26 watchdog kills in two hours, each also forcing a session
+/// restart. A truly wedged session still dies here, just later.
+pub const ACTIVE_STALL: Duration = Duration::from_secs(120);
 /// A session paused for longer than this may be reclaimed by a tick.
 pub const PAUSED_RECLAIM_SECONDS: i64 = 24 * 60 * 60;
 
@@ -287,7 +294,7 @@ struct Inner {
     // would close the slave out from under the child.
     #[expect(dead_code, reason = "owns the pty; must stay alive for the session")]
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Set once the exit status has been collected. `waitpid` can only be called
     /// once, so a second `close()` must not try again.
     reaped: bool,
@@ -314,7 +321,39 @@ pub struct ResidentSession {
     deliver_timeout: Duration,
     /// Pinned `GEMINI_MEMORY_SCOPE` so a rebuild re-injects the same group.
     memory_scope: Option<String>,
+    #[cfg(unix)]
+    process_group: Option<OwnedProcessGroup>,
     inner: tokio::sync::Mutex<Inner>,
+}
+
+impl Drop for ResidentSession {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(group) = &self.process_group {
+            group.kill_now();
+        }
+        let inner = self.inner.get_mut();
+        if let Some(mut child) = inner.child.take() {
+            if inner.reaped {
+                return;
+            }
+            let _ = child.kill();
+            // Cancellation may run without a Tokio runtime. Reap this exact child
+            // on a bounded thread, never waitpid(-1) against another supervisor.
+            let _ = std::thread::Builder::new()
+                .name("resident-reap".into())
+                .spawn(move || {
+                    let deadline = Instant::now() + REAP_GRACE;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) | Err(_) => break,
+                            Ok(None) if Instant::now() >= deadline => break,
+                            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                        }
+                    }
+                });
+        }
+    }
 }
 
 impl ResidentSession {
@@ -392,9 +431,11 @@ impl ResidentSession {
             audit,
             deliver_timeout: config.deliver_timeout(),
             memory_scope: config.memory_scope.clone(),
+            #[cfg(unix)]
+            process_group: child.process_id().map(OwnedProcessGroup::new),
             inner: tokio::sync::Mutex::new(Inner {
                 master: pair.master,
-                child,
+                child: Some(child),
                 reaped: false,
                 writer,
                 state: SessionState::Spawning,
@@ -472,7 +513,12 @@ impl ResidentSession {
 
     /// Child pid, for audit/logging.
     pub async fn pid(&self) -> Option<u32> {
-        self.inner.lock().await.child.process_id()
+        self.inner
+            .lock()
+            .await
+            .child
+            .as_ref()
+            .and_then(|child| child.process_id())
     }
 
     /// Drain accumulated audit actions. Rev 3 forwards these to `audit_events`.
@@ -517,7 +563,7 @@ impl ResidentSession {
 
     async fn child_exit(&self) -> Option<String> {
         let mut inner = self.inner.lock().await;
-        match inner.child.try_wait() {
+        match inner.child.as_mut()?.try_wait() {
             Ok(Some(status)) => Some(format!(
                 "exit code {}{}",
                 status.exit_code(),
@@ -738,12 +784,27 @@ impl ResidentSession {
         if !active_turn {
             return Ok(());
         }
-        let idle_screen = self.screen_text().contains(AGY_READY_MARKER);
-        let stalled = {
+        let screen = self.screen_text();
+        let idle_screen = screen.contains(AGY_READY_MARKER);
+        let (progress_age, steps, bound) = {
             let inner = self.inner.lock().await;
-            inner.last_progress.elapsed() > ACTIVE_STALL
+            (
+                inner.last_progress.elapsed(),
+                inner.progress_signal.0,
+                inner.db_path.is_some(),
+            )
         };
-        if stalled && !idle_screen {
+        if progress_age > ACTIVE_STALL && !idle_screen {
+            // K1 evidence contains counts/state only, never PTY or model text.
+            push_audit(
+                &self.audit,
+                format!(
+                    "resident.watchdog.g{}.age_ms{}.steps{steps}.bound{bound}.ready{idle_screen}.screen_bytes{}",
+                    self.group_id,
+                    progress_age.as_millis(),
+                    screen.len(),
+                ),
+            );
             let reason = format!("步流 {}s 无变化且屏幕无就绪信号", ACTIVE_STALL.as_secs());
             self.mark_dead(&reason).await?;
             return Err(ResidentError::Crash(reason));
@@ -783,12 +844,24 @@ impl ResidentSession {
     pub async fn close(&self) {
         if self.child_exit().await.is_none() {
             let _ = self.write_raw(AGY_EXIT_COMMAND).await;
-            if self.await_exit(CLOSE_GRACE).await {
-                self.reap().await;
-                return;
-            }
+            let _ = self.await_exit(CLOSE_GRACE).await;
         }
         self.force_stop().await;
+    }
+
+    /// Hard work deadline: stop owned processes now, then perform bounded reap.
+    /// Normal shutdown still uses `/exit` and TERM grace through `close`.
+    pub(crate) async fn abort(&self) {
+        #[cfg(unix)]
+        if let Some(group) = &self.process_group {
+            group.kill_now();
+        }
+        if self.child_exit().await.is_none()
+            && let Some(child) = self.inner.lock().await.child.as_mut()
+        {
+            let _ = child.kill();
+        }
+        self.reap().await;
     }
 
     /// Escalating stop after `/exit` was ignored: SIGTERM, then SIGKILL,
@@ -796,30 +869,12 @@ impl ResidentSession {
     /// wrapper shell's grandchild must not outlive the session).
     #[cfg(unix)]
     async fn force_stop(&self) {
-        for (signal, grace) in [
-            (Signal::SIGTERM, TERM_GRACE),
-            (Signal::SIGKILL, Duration::from_millis(500)),
-        ] {
-            // The child is a session leader (portable-pty calls `setsid` in its
-            // `pre_exec`), so its pgid equals its pid and the signal can be aimed at
-            // the whole group. `agy` is often a wrapper shell around the real CLI;
-            // signalling only the leader would leave the grandchild running while the
-            // leader exits, and the grandchild then belongs to the bot process.
-            let pid = self.pid().await;
-            if let Some(pid) = pid {
-                let pgrp = Pid::from_raw(pid as i32);
-                if killpg(pgrp, signal).is_err() {
-                    // No group of our own (a race with the child exiting, or a pty
-                    // implementation that did not setsid): fall back to the leader.
-                    let _ = send_signal(pgrp, signal);
-                }
-            }
-            if self.await_exit(grace).await {
-                self.reap().await;
-                return;
-            }
+        if let Some(group) = &self.process_group {
+            // Reap the leader while waiting for the *group*, not instead of it.
+            tokio::join!(group.stop(TERM_GRACE), self.await_exit(TERM_GRACE));
+        } else if let Some(child) = self.inner.lock().await.child.as_mut() {
+            let _ = child.kill();
         }
-        let _ = self.await_exit(Duration::from_millis(500)).await;
         self.reap().await;
     }
 
@@ -829,7 +884,9 @@ impl ResidentSession {
     async fn force_stop(&self) {
         {
             let mut inner = self.inner.lock().await;
-            let _ = inner.child.kill();
+            if let Some(child) = inner.child.as_mut() {
+                let _ = child.kill();
+            }
         }
         let _ = self.await_exit(Duration::from_millis(500)).await;
         self.reap().await;
@@ -873,7 +930,10 @@ impl ResidentSession {
         if inner.reaped {
             return true;
         }
-        match inner.child.try_wait() {
+        let Some(child) = inner.child.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
             Ok(Some(_)) => {
                 inner.reaped = true;
                 true

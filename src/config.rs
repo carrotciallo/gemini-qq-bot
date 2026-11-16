@@ -35,6 +35,46 @@ pub const DEFAULT_AGY_BIN: &str = "/opt/agy/agy";
 /// Default Mihomo binary path inside the bot container.
 pub const DEFAULT_MIHOMO_BIN: &str = "/opt/mihomo/mihomo";
 
+/// Tunables for the spontaneous-topic engine (`[spontaneous]` in bot.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpontaneousConfig {
+    /// Master switch: one flag stops the whole engine.
+    pub enabled: bool,
+    /// Most successful topic openings per group per day.
+    pub daily_cap: u32,
+    /// Most attempts (openings + declines) per group per day.
+    pub max_attempts: u32,
+    /// Local hour the quiet window starts (inclusive). Asia/Shanghai.
+    pub quiet_start_hour: u32,
+    /// Local hour the quiet window ends (exclusive).
+    pub quiet_end_hour: u32,
+    /// Shortest silence (minutes) before an opening is considered; the day's
+    /// actual threshold is picked deterministically in [min, max] per group.
+    pub silence_min_minutes: i64,
+    /// Longest silence (minutes) in that per-day range.
+    pub silence_max_minutes: i64,
+    /// Retained so existing config files still parse; no longer consulted.
+    /// Since 2026-11-12 the pace gate is a whitelist in the engine itself:
+    /// only `normal` and `lively` groups get spontaneous openings.
+    pub exclude_addressed_only: bool,
+}
+
+impl Default for SpontaneousConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            daily_cap: 2,
+            max_attempts: 3,
+            quiet_start_hour: 1,
+            quiet_end_hour: 8,
+            silence_min_minutes: 45,
+            silence_max_minutes: 120,
+            exclude_addressed_only: true,
+        }
+    }
+}
+
 /// Non-secret, file backed tunables. Loaded from `bot.toml` when present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -63,6 +103,10 @@ pub struct FileConfig {
     pub memory_context_budget: usize,
     /// Memory compactor daily cap, including manual runs.
     pub compaction_daily_limit: u32,
+    /// Spontaneous-topic engine (schema v1): she may open a topic of her own
+    /// after a long silence. See [`SpontaneousConfig`].
+    #[serde(default)]
+    pub spontaneous: SpontaneousConfig,
     /// Per-group cap on agent calls started within any rolling hour.
     ///
     /// A fuse against runaway loops, not a pacing tool: when a group reaches the
@@ -169,6 +213,7 @@ impl Default for FileConfig {
             mihomo_proxy_port: 7890,
             memory_context_budget: 4_000,
             compaction_daily_limit: 10,
+            spontaneous: SpontaneousConfig::default(),
             hourly_call_budget: 60,
             flood_enabled: true,
             conversation_turn_limit: 35,
@@ -238,6 +283,25 @@ pub struct Config {
     pub media_max_pixels: u64,
     /// Where sticker bytes live. Empty disables the library entirely.
     pub sticker_dir: PathBuf,
+    /// Where generated pictures land before delivery (imagegen executor output).
+    pub imagegen_dir: PathBuf,
+    /// The agy binary the imagegen executor runs. Deliberately separate from
+    /// `agy_bin`: the resident's pinned version cannot generate pictures
+    /// (1.5.2 hangs in the image subagent; 1.5.5 works — 2026-11-11 smoke).
+    pub imagegen_bin: PathBuf,
+    /// The imagegen executor's own agy home: no tool-guard hooks (the
+    /// resident's guard bans subagents, image generation included), scoped
+    /// file permissions. Provisioned by `deploy/imagegen/provision.sh`.
+    pub imagegen_home: PathBuf,
+    /// Which imagegen backend draws first: "web" (the Gemini web worker)
+    /// or "agy". The web backend falls back to agy on any failure.
+    pub imagegen_backend: String,
+    /// Base URL of the web imagegen worker (host-side service).
+    pub imagegen_web_url: String,
+    /// Bearer token for the web imagegen worker, when it sets one.
+    pub imagegen_web_token: Option<String>,
+    /// Where the persona reference sheet and character card live.
+    pub persona_dir: PathBuf,
     /// Root for per-group Agy project directories (each holds that group's AGENTS.md).
     pub agy_projects_dir: PathBuf,
     pub agy_bin: PathBuf,
@@ -377,6 +441,20 @@ impl Config {
         // as the database so a backup of /data captures both halves.
         let sticker_dir =
             PathBuf::from(env("STICKER_DIR").unwrap_or_else(|| "/data/stickers".to_string()));
+        let imagegen_dir =
+            PathBuf::from(env("IMAGEGEN_DIR").unwrap_or_else(|| "/data/imagegen".to_string()));
+        let imagegen_bin = PathBuf::from(
+            env("IMAGEGEN_AGY_BIN").unwrap_or_else(|| "/data/agy-img-bin/agy".to_string()),
+        );
+        let imagegen_home = PathBuf::from(
+            env("IMAGEGEN_AGY_HOME").unwrap_or_else(|| "/data/agy-img-home".to_string()),
+        );
+        let imagegen_backend = env("IMAGEGEN_BACKEND").unwrap_or_else(|| "agy".to_string());
+        let imagegen_web_url = env("IMAGEGEN_WEB_URL")
+            .unwrap_or_else(|| "http://host.docker.internal:18711".to_string());
+        let imagegen_web_token = env("IMAGEGEN_WEB_TOKEN");
+        let persona_dir =
+            PathBuf::from(env("PERSONA_DIR").unwrap_or_else(|| "/data/persona".to_string()));
         // Long-lived per-group Agy project directories. The character card lives in the
         // group's directory as AGENTS.md, which Agy reads by itself each run, so the card
         // is not re-sent as prompt text on every turn.
@@ -443,6 +521,13 @@ impl Config {
             media_max_bytes,
             media_max_pixels,
             sticker_dir,
+            imagegen_dir,
+            imagegen_backend,
+            imagegen_web_url,
+            imagegen_web_token,
+            imagegen_bin,
+            imagegen_home,
+            persona_dir,
             agy_projects_dir,
             agy_bin,
             agy_model,

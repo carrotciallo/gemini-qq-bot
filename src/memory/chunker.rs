@@ -2,8 +2,8 @@
 //!
 //! The raw log (`group_messages`) is written on intake and never deleted. This module
 //! is the only thing that reads it in bulk: when the unarchived tail grows past
-//! [`TRIGGER_MESSAGES`], the oldest window is folded into one summary by the cheap
-//! Aux model and the folded rows are flagged `archived = 1`.
+//! [`TRIGGER_MESSAGES`], the oldest window is folded into one summary by the memory
+//! model and the folded rows are flagged `archived = 1`.
 //!
 //! Two rules shape everything here:
 //!
@@ -81,14 +81,11 @@ pub struct FoldOutcome {
     pub seq: i64,
     pub folded_messages: i64,
     pub summary: String,
-    /// What the extraction pass harvested from the same response. Always present, and
-    /// always harmless: a fold is a success even when this says `Absent`.
-    pub extracted: crate::memory::extract::ExtractionReport,
 }
 
 /// A tail older than this folds even below [`TRIGGER_MESSAGES`]: without an age
 /// trigger, a group chatting steadily under the count trigger (or a quiet group
-/// that never reaches it) keeps its oldest hours out of chunks and extraction
+/// that never reaches it) keeps its oldest hours out of chunks
 /// indefinitely — 2026-10-27: one group went two hours of heavy chat with zero
 /// new memories because the count trigger had not tripped.
 pub const TRIGGER_AGE_SECONDS: i64 = 2_700;
@@ -156,30 +153,6 @@ pub fn render_fold_prompt(messages: &[GroupMessageRecord], aliases: &[(String, S
         out.push('\n');
     }
     out.push('\n');
-    out.push_str(
-        // Extraction shares this call: a second round trip to the same model would
-        // double the cost of the most frequent background job for no new information.
-        "Also list the durable facts worth remembering long-term, separately from the \
-         note. Only facts a participant would expect the bot to still know weeks later: \
-         stable preferences, lasting relations between people, decided plans, things that \
-         already happened. Never greetings, filler, or anything already obvious from the \
-         note.\n\
-         Each item: {\"kind\": one of fact|preference|topic|relation|event, \
-         \"subject\": the alias of the person it is about (required for any item about a person; \"\" only for facts about the group as a whole) or \"\" for the whole group, \
-         \"content\": one sentence under 200 characters, \
-         \"confidence\": 0.0-0.8, \
-         \"source_refs\": [the line labels, e.g. \"m3\"]}.\n\
-         An item about the assistant itself uses subject \"bot\". An item about a \
-         person MUST carry that person's alias as subject — if you cannot tell \
-         who it is about, drop the item instead of guessing, and never write the \
-         placeholder \"member\" in content; refer to people by their alias.\n\
-         Skip jokes, hyperbole, memes and one-off banter: a claim the group is \
-         laughing at is not a fact, even when phrased like one. Skip the \
-         assistant's own persona, catchphrases and settings — that is \
-         configuration, not a group fact.\n\
-         At most 6 items. Use an empty array when nothing qualifies.\n\
-         Respond with {\"summary\": \"<note>\", \"memories\": [...]}.\n",
-    );
     out
 }
 
@@ -253,8 +226,6 @@ pub fn chunk_reject_reason(text: &str) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct Chunker {
     store: Arc<SqliteStore>,
-    /// Aux backend that produced the fold (see `Extractor::with_origin`).
-    origin: &'static str,
     /// Model label recorded on committed chunks.
     model_label: String,
 }
@@ -263,14 +234,8 @@ impl Chunker {
     pub fn new(store: Arc<SqliteStore>) -> Self {
         Self {
             store,
-            origin: crate::store::origin::HY3,
             model_label: crate::config::DEFAULT_AUX_MODEL.to_string(),
         }
-    }
-
-    pub fn with_origin(mut self, origin: &'static str) -> Self {
-        self.origin = origin;
-        self
     }
 
     pub fn with_model_label(mut self, model_label: String) -> Self {
@@ -353,19 +318,11 @@ impl Chunker {
             .await
             .map_err(|_| FoldSkip::StoreError)?;
 
-        // Extraction runs after the chunk is committed and on the same raw response.
-        // It can only add rows; nothing here can undo the fold above.
-        let extracted = crate::memory::extract::Extractor::new(Arc::clone(&self.store))
-            .with_origin(self.origin)
-            .run(bot_id, group_id, &window, &raw, &aliases, now)
-            .await;
-
         Ok(Some(FoldOutcome {
             chunk_id,
             seq,
             folded_messages: ids.len() as i64,
             summary,
-            extracted,
         }))
     }
 }
@@ -553,37 +510,34 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_asks_for_candidates_in_the_same_call() {
+    fn the_prompt_no_longer_asks_for_candidates() {
+        // Memfix [mf-3]: extraction retired — the fold asks for the note
+        // only; new memory rows come from the agent's own writes.
         let prompt = render_fold_prompt(&[record(1, "42", "明天开会")], &[]);
-        assert!(prompt.contains("\"memories\""), "必须同批请求候选段");
-        // Line labels are how a candidate cites the window it came from.
+        assert!(!prompt.contains("\"memories\""), "不得再索取候选段");
+        assert!(!prompt.contains("source_refs"));
+        assert!(prompt.contains("\"summary\""), "仍只索取摘要");
         assert!(prompt.contains("m1. "), "每条消息需要行号前缀");
-        assert!(prompt.contains("source_refs"));
     }
 
     #[tokio::test]
-    async fn a_broken_candidate_block_still_leaves_a_finished_fold() {
+    async fn extra_reply_fields_do_not_fail_the_fold() {
         let (chunker, _dir) = seeded_chunker().await;
-        // Valid summary, unusable candidates: the fold is a success and extraction
-        // reports the breakage instead of failing the whole pass.
+        // The reader takes the `summary` field and ignores the rest of the
+        // reply object, whatever the model chose to add.
         let summary = "大家这周聊了攒机、周末聚餐和下个月的旅行计划，几件事都定了时间和负责人，还约好下周继续跟进后续的安排和预算情况。";
         let body = serde_json::json!({ "summary": summary, "memories": "not an array" });
         let model: Arc<dyn SummaryModel> = Arc::new(StubModel(Ok(body.to_string())));
         let outcome = chunker
             .fold_once("9999", "500", &model, vec![], 1_003)
             .await
-            .expect("候选段损坏不得让 fold 失败")
+            .expect("多余字段不得让 fold 失败")
             .expect("应有结果");
         assert_eq!(outcome.summary, summary);
-        assert_eq!(
-            outcome.extracted.status,
-            Some(crate::memory::extract::CandidateParseStatus::Broken)
-        );
-        assert_eq!(outcome.extracted.created, 0);
     }
 
     #[tokio::test]
-    async fn a_missing_candidate_block_still_leaves_a_finished_fold() {
+    async fn a_plain_summary_reply_folds_cleanly() {
         let (chunker, _dir) = seeded_chunker().await;
         let summary = "大家这周聊了攒机、周末聚餐和下个月的旅行计划，几件事都定了时间和负责人，还约好下周继续跟进后续的安排和预算情况。";
         let body = serde_json::json!({ "summary": summary });
@@ -591,12 +545,8 @@ mod tests {
         let outcome = chunker
             .fold_once("9999", "500", &model, vec![], 1_004)
             .await
-            .expect("缺失候选段不得让 fold 失败")
+            .expect("应折叠")
             .expect("应有结果");
         assert_eq!(outcome.summary, summary);
-        assert_eq!(
-            outcome.extracted.status,
-            Some(crate::memory::extract::CandidateParseStatus::Absent)
-        );
     }
 }

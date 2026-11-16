@@ -529,23 +529,22 @@ pub fn plain_text_reply(raw: &str) -> Option<String> {
     if text.contains("call_mcp_tool") || text.contains("```") {
         return None;
     }
-    // The same markup the reply path must never relay.
-    if crate::agent::contract::contains_forbidden_markup(text) {
+    // Content policy is shared with both structured delivery gates. The
+    // surrounding checks remain L4's prose-vs-document recovery heuristics.
+    if crate::agent::contract::reply_content_rejection(text).is_some() {
         return None;
     }
-    // Contract vocabulary means a mangled document, not an answer.
-    const CONTRACT_MARKERS: [&str; 8] = [
-        "should_reply",
-        "reply_parts",
-        "reply_text",
-        "memory_ops",
-        "sticker_ops",
-        "nicknames",
-        "quote_ref",
-        "mood_update",
-    ];
-    if CONTRACT_MARKERS.iter().any(|marker| text.contains(marker)) {
-        return None;
+    let parts = crate::agent::segments::finalize_reply(text, None);
+    // L4 may still clamp a long prose answer later; scan bounded overlapping
+    // windows rather than making its recovery length policy stricter here.
+    for start in 0..parts.len() {
+        let end = (start + crate::agent::segments::MAX_REPLY_PARTS).min(parts.len());
+        if crate::agent::contract::reply_part_rejections(&parts[start..end])
+            .iter()
+            .any(Option::is_some)
+        {
+            return None;
+        }
     }
     // A wall of JSON-ish punctuation with no sentence structure is a dump.
     let structural = text

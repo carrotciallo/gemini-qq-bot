@@ -97,6 +97,12 @@ pub(super) fn map_memory(r: sqlx::sqlite::SqliteRow) -> MemoryRecord {
         archived_at: r.get("archived_at"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+        slot: r.get("slot"),
+        tags: crate::memory::schema::parse_tags_column(&r.get::<String, _>("tags")),
+        expires_at: r.get("expires_at"),
+        state: r.get("state"),
+        superseded_by: r.get("superseded_by"),
+        state_changed_at: r.get("state_changed_at"),
     }
 }
 

@@ -823,14 +823,17 @@ fn replay_guard_lets_fresh_and_short_lines_through() {
 }
 
 #[test]
-fn an_insert_renders_plain_lines_without_message_refs() {
+fn an_insert_renders_stable_appended_refs_without_wire_ids() {
     let mut first = message("c1", "u1", "第一行\n第二行", 0);
     first.display_name = "Ai".into();
     let mut second = message("c2", "u2", "", 0);
     second.mentions_bot = true;
     second.display_name = "  ".into();
-    let rendered = render_insert_lines(&[first, second]);
-    assert_eq!(rendered, "- Ai：第一行 第二行\n- 群友：（点了你）\n");
+    let rendered = render_insert_lines(&[first, second], 3);
+    assert_eq!(
+        rendered,
+        "- m3 u1 Ai：第一行 第二行\n- m4 u2 群友：（点了你）\n"
+    );
     assert!(!rendered.contains("m1"));
     assert!(!rendered.contains("c1"));
 }
@@ -1225,6 +1228,7 @@ fn empty_scope() -> ValidationScope {
         memory_refs: Vec::new(),
         history_refs: Vec::new(),
         sticker_hashes: Vec::new(),
+        sealed_topics: Vec::new(),
     }
 }
 
@@ -1361,7 +1365,196 @@ async fn claimed_job(store: &SqliteStore, events: &[IncomingMessage]) -> BatchJo
         flooded: false,
         flood_background: None,
         retry: false,
+        spontaneous: None,
     }
+}
+
+async fn spontaneous_failure_job(store: &SqliteStore) -> BatchJob {
+    let now = crate::now_unix();
+    let mut event = message("spontaneous-test", "1", "想聊聊：天气", 0);
+    event.speaker_role = SpeakerRole::Bot;
+    event.received_at = now;
+    let id = store
+        .insert_spontaneous_pending(
+            "1",
+            "100",
+            "spontaneous-test",
+            now,
+            &serde_json::to_string(&event).unwrap(),
+            "sp-failure",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    BatchJob {
+        group_id: "100".into(),
+        batch_id: "sp-failure".into(),
+        event_ids: vec![id],
+        privileged: false,
+        chars: 10,
+        images: 0,
+        flooded: false,
+        flood_background: None,
+        retry: false,
+        spontaneous: Some(crate::pipeline::scheduler::SpontaneousBrief {
+            topic: "天气".into(),
+            angle: String::new(),
+        }),
+    }
+}
+
+async fn assert_spontaneous_not_reclaimable(store: &SqliteStore, job: &BatchJob) {
+    let rows = store.pending_for_group("1", "100").await.unwrap();
+    let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+    assert!(
+        ids.iter().all(|id| !job.event_ids.contains(id)),
+        "synthetic input re-entered intake: {ids:?}"
+    );
+    assert!(
+        store
+            .claim_batch(&job.event_ids, "accidental-replay")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let synthetic: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pending_events WHERE message_id = 'spontaneous-test'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(synthetic, 0, "terminal synthetic input must be consumed");
+    let effects: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM outbox) + (SELECT COUNT(*) FROM image_jobs)",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(effects, 0, "no outbound text, sticker or image work");
+}
+
+#[tokio::test]
+async fn spontaneous_failure_budget_never_reenters_intake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture_with_budget(&dir, 1).await;
+    let job = spontaneous_failure_job(&store).await;
+    store
+        .start_call("1", "100", "used", crate::now_unix())
+        .await
+        .unwrap();
+    assert_eq!(executor.run_batch(&job).await, TurnResult::BudgetDeferred);
+    assert_spontaneous_not_reclaimable(&store, &job).await;
+}
+
+#[tokio::test]
+async fn spontaneous_failure_proxy_never_reenters_intake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor).unwrap().mihomo = Arc::new(Mihomo::new(
+        crate::process::mihomo::MihomoConfig {
+            bin: Default::default(),
+            config_path: Default::default(),
+            api_port: 0,
+            proxy_port: 0,
+            api_secret: None,
+        },
+        true,
+    ));
+    let job = spontaneous_failure_job(&store).await;
+    assert_eq!(executor.run_batch(&job).await, TurnResult::DeferredProxy);
+    assert_spontaneous_not_reclaimable(&store, &job).await;
+}
+
+#[tokio::test]
+async fn spontaneous_failure_backoff_never_reenters_intake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture(&dir).await;
+    executor
+        .resident
+        .note_respawn_failure("100", crate::now_unix())
+        .await;
+    let job = spontaneous_failure_job(&store).await;
+    assert_eq!(executor.run_batch(&job).await, TurnResult::DeferredProxy);
+    assert_spontaneous_not_reclaimable(&store, &job).await;
+}
+
+#[tokio::test]
+async fn spontaneous_failure_pty_spawn_never_reenters_intake() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture(&dir).await;
+    let job = spontaneous_failure_job(&store).await;
+    assert_eq!(executor.run_batch(&job).await, TurnResult::AgentFailed);
+    assert_spontaneous_not_reclaimable(&store, &job).await;
+}
+
+#[tokio::test]
+async fn spontaneous_failure_retirement_preserves_inserted_human_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture(&dir).await;
+    let job = spontaneous_failure_job(&store).await;
+    let human = claimed_job(&store, &[message("human", "555", "hello", 0)]).await;
+    let coverage = ResidentCoverage {
+        batches: [&job, &human]
+            .into_iter()
+            .map(|job| ResidentDelivery {
+                batch_id: job.batch_id.clone(),
+                event_ids: job.event_ids.clone(),
+                newest: crate::now_unix(),
+                privileged: job.privileged,
+            })
+            .collect(),
+    };
+    let call = store
+        .start_call("1", "100", &job.batch_id, crate::now_unix())
+        .await
+        .unwrap();
+    executor
+        .retire_resident(
+            &executor.resident,
+            &job,
+            &call,
+            "no_submission",
+            "agent_failed",
+            &coverage,
+        )
+        .await;
+    assert_spontaneous_not_reclaimable(&store, &job).await;
+    assert_eq!(
+        store
+            .pending_for_group("1", "100")
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        human.event_ids
+    );
+}
+
+#[tokio::test]
+async fn spontaneous_failure_restart_preserves_only_human_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture(&dir).await;
+    let job = spontaneous_failure_job(&store).await;
+    let human = claimed_job(&store, &[message("human", "555", "hello", 0)]).await;
+    drop(executor);
+    store.pool().close().await;
+    let pool = crate::store::migrations::open_and_migrate(&dir.path().join("bot.sqlite3"))
+        .await
+        .unwrap();
+    let store = SqliteStore::new(pool);
+    store.release_orphaned_claims("1").await.unwrap();
+    assert_spontaneous_not_reclaimable(&store, &job).await;
+    assert_eq!(
+        store
+            .pending_for_group("1", "100")
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        human.event_ids
+    );
 }
 
 async fn audit_actions(store: &SqliteStore) -> Vec<String> {
@@ -1560,6 +1753,12 @@ fn seed_brief_combines_summary_facts_and_window() {
         archived_at: None,
         created_at: 1,
         updated_at: 1,
+        slot: String::new(),
+        tags: Vec::new(),
+        expires_at: None,
+        state: "active".to_string(),
+        superseded_by: None,
+        state_changed_at: None,
     }];
     let window = vec![crate::store::GroupMessageRecord {
         id: 1,
@@ -1617,6 +1816,12 @@ fn seed_brief_names_a_facts_subject_when_the_content_does_not() {
         archived_at: None,
         created_at: 1,
         updated_at: 1,
+        slot: String::new(),
+        tags: Vec::new(),
+        expires_at: None,
+        state: "active".to_string(),
+        superseded_by: None,
+        state_changed_at: None,
     }];
     let names: std::collections::HashMap<String, String> = [("555".to_string(), "Ai".to_string())]
         .into_iter()
@@ -1912,14 +2117,331 @@ async fn continuing_conversation_gets_no_seed() {
     assert!(!prompt.contains("前情提要"), "续接轮次不付播种成本");
 }
 
-/// The one fixture every test here builds on.
-///
-/// There is no agent runner to inject any more: a turn is finished by handing
-/// [`TurnExecutor::finish_turn_with_coverage`] the contract JSON the model was
-/// supposed to produce, which is what the resident path does after it has read a
-/// step off the PTY. Tests therefore exercise the real post-agent code — contract
-/// validation, salvage, memory, the reply gates, the outbox — without spawning a
-/// terminal or a subprocess.
+#[tokio::test]
+async fn round_deadline_settlement_seals_delivery_without_replaying_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor).unwrap().output_channel = crate::config::OutputChannel::Mcp;
+    let job = claimed_job(&store, &[message("cancel-original", "u1", "hello", 0)]).await;
+    let group = store.get_group("1", "100").await.unwrap().unwrap();
+    let now = crate::now_unix();
+    let _prepared = executor.prepare_turn(&job, &group, now).await.unwrap();
+    store
+        .start_call("1", "100", &job.batch_id, now)
+        .await
+        .unwrap();
+    let inserted = claimed_job(&store, &[message("cancel-insert", "u1", "more", 0)]).await;
+    store.release_events(&inserted.event_ids).await.unwrap();
+    store
+        .claim_batch(&inserted.event_ids, "owned-insert")
+        .await
+        .unwrap();
+    let untouched = claimed_job(&store, &[message("untouched", "u1", "later", 0)]).await;
+    store.release_events(&untouched.event_ids).await.unwrap();
+    store
+        .claim_batch(&untouched.event_ids, "unrelated-owner")
+        .await
+        .unwrap();
+    let ids = executor
+        .outbox
+        .enqueue_mixed(
+            "1",
+            "100",
+            &job.batch_id,
+            &["first".into(), "second".into(), "third".into()],
+            &[],
+            &[],
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .mark_outbox(&ids[0], crate::store::OutboxState::Sent, Some("ack"), now)
+        .await
+        .unwrap();
+    store
+        .mark_outbox(&ids[1], crate::store::OutboxState::Sending, None, now)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .expire_turn(
+                "1",
+                "100",
+                &job.batch_id,
+                &job.event_ids,
+                &["owned-insert".into()],
+                now,
+            )
+            .await
+            .unwrap();
+    }
+    let rows = all_outbox_rows(&store).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.iter().filter(|r| r.state == "sent").count(), 1);
+    assert_eq!(rows.iter().filter(|r| r.state == "unknown").count(), 2);
+    assert!(store.armed_turn("100").await.unwrap().is_none());
+    assert!(
+        store
+            .pending_for_group("1", "100")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let remaining: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, batch_id FROM pending_events ORDER BY id")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        vec![(untouched.event_ids[0], "unrelated-owner".into())]
+    );
+    assert!(
+        store
+            .recent_calls("1", "100", 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.state == "failed" && c.error_class.as_deref() == Some("turn_deadline"))
+    );
+}
+
+struct DeadlineSlowFetcher;
+
+#[async_trait::async_trait]
+impl ImageFetcher for DeadlineSlowFetcher {
+    async fn fetch(
+        &self,
+        _url: &str,
+        _max_bytes: u64,
+    ) -> Result<crate::media::download::DownloadedImage, crate::media::download::MediaError> {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        unreachable!("the turn deadline must cancel preparation")
+    }
+}
+
+#[tokio::test]
+async fn round_deadline_includes_slow_preparation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    let config = Arc::get_mut(&mut executor).unwrap();
+    config.resident_limits.hard_cap_s = 1;
+    config.media_fetcher = Arc::new(DeadlineSlowFetcher);
+    let mut event = message("slow-image", "u1", "look", 0);
+    event.segments.push(Segment::Image {
+        url: Some("https://media.example/slow.png".into()),
+        file: None,
+        sub_type: None,
+    });
+    let job = claimed_job(&store, &[event]).await;
+    let started = std::time::Instant::now();
+    let result =
+        tokio::time::timeout(std::time::Duration::from_secs(2), executor.run_batch(&job)).await;
+    executor.resident.close_all().await;
+    assert_eq!(
+        result,
+        Ok(TurnResult::AgentFailed),
+        "preparation exceeded the whole-turn budget"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(store.pending_for_group("1", "100").await.unwrap().len(), 1);
+    assert!(all_outbox_rows(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn round_deadline_includes_cold_bootstrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor)
+        .unwrap()
+        .resident_limits
+        .hard_cap_s = 1;
+    let bin = dir.path().join("agy");
+    std::fs::write(&bin, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let job = claimed_job(&store, &[message("slow-bootstrap", "u1", "hello", 0)]).await;
+    let started = std::time::Instant::now();
+    let result =
+        tokio::time::timeout(std::time::Duration::from_secs(2), executor.run_batch(&job)).await;
+    executor.resident.close_all().await;
+    assert_eq!(
+        result,
+        Ok(TurnResult::AgentFailed),
+        "bootstrap exceeded the whole-turn budget"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(!executor.resident.has_session("100").await);
+    assert!(store.armed_turn("100").await.unwrap().is_none());
+    assert_eq!(store.pending_for_group("1", "100").await.unwrap().len(), 1);
+    assert!(
+        store
+            .recent_calls("1", "100", 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.state != "running")
+    );
+    assert!(all_outbox_rows(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn round_deadline_checks_commit_boundary_before_outbox() {
+    for expired in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut executor, store) = executor_fixture(&dir).await;
+        Arc::get_mut(&mut executor)
+            .unwrap()
+            .resident_limits
+            .hard_cap_s = 1;
+        let job = claimed_job(&store, &[message("boundary", "u1", "hello", 0)]).await;
+        let group = store.get_group("1", "100").await.unwrap().unwrap();
+        let now = crate::now_unix();
+        let prepared = executor.prepare_turn(&job, &group, now).await.unwrap();
+        let call = store
+            .start_call("1", "100", &job.batch_id, now)
+            .await
+            .unwrap();
+        let coverage = ResidentCoverage {
+            batches: vec![ResidentDelivery {
+                batch_id: job.batch_id.clone(),
+                event_ids: job.event_ids.clone(),
+                newest: now,
+                privileged: false,
+            }],
+        };
+        let agent_started = std::time::Instant::now();
+        let turn_started =
+            agent_started - std::time::Duration::from_secs(if expired { 2 } else { 0 });
+        let result = executor
+            .finish_turn_with_coverage(
+                &job,
+                &call,
+                PLAIN_CONTRACT,
+                TurnTiming {
+                    turn_started,
+                    agent_started,
+                },
+                prepared,
+                coverage,
+            )
+            .await;
+        if expired {
+            assert_eq!(result, Err(TurnResult::AgentFailed));
+            assert!(
+                all_outbox_rows(&store).await.is_empty(),
+                "expired commit created an outbox row"
+            );
+        } else {
+            assert_eq!(result, Ok(TurnResult::Replied));
+            assert_eq!(all_outbox_rows(&store).await.len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn seal_read_failure_never_prepares_unconstrained_scope_or_memory_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture(&dir).await;
+    let job = claimed_job(&store, &[message("seal-fault", "u1", "hello", 0)]).await;
+    let group = store.get_group("1", "100").await.unwrap().unwrap();
+    store
+        .insert_memory("1", "100", None, "封存旧事实", "fact", "[]", 0.9, 1)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE sealed_topics RENAME TO sealed_topics_fault_fixture")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let prepared = executor.prepare_turn(&job, &group, crate::now_unix()).await;
+    assert!(
+        matches!(prepared, Err(TurnResult::AgentFailed)),
+        "failed constraint read produced an unconstrained turn"
+    );
+    assert!(
+        executor.load_memory_inputs("100").await.0.is_empty(),
+        "failed seal read exposed old memories"
+    );
+    assert_eq!(
+        store
+            .pending_for_group("1", "100")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        job.event_ids
+    );
+    assert!(all_outbox_rows(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn audit_redaction_named_credentials_preserves_normal_chinese() {
+    let dir = tempfile::tempdir().unwrap();
+    let (executor, store) = executor_fixture(&dir).await;
+    let payload = "正常中文 api_key=fixture-named-secret-123456 完成";
+    executor.audit_bad_output("200", payload, payload).await;
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_events WHERE action LIKE 'agent.bad_output.%'",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(actions.len(), 2);
+    for action in actions {
+        assert!(action.contains("正常中文"));
+        assert!(
+            !action.contains("fixture-named"),
+            "named credential survived audit redaction"
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_redaction_known_value_is_masked_before_preview_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    let secret = "FIXTURE_KNOWN_SECRET_VALUE_ONLY_123456";
+    Arc::get_mut(&mut executor)
+        .unwrap()
+        .secrets
+        .push(secret.into());
+    let payload = format!("{}{} 尾部", "文".repeat(70), secret);
+    executor.audit_bad_output("200", &payload, &payload).await;
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_events WHERE action LIKE 'agent.bad_output.%'",
+    )
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(actions.len(), 2);
+    for action in actions {
+        assert!(action.contains("文"));
+        assert!(
+            !action.contains("FIXTURE_"),
+            "partial secret survived truncation"
+        );
+    }
+}
+
+/// Shared offline executor; post-agent tests supply a contract directly, while
+/// lifecycle/deadline tests explicitly create a local stand-in PTY.
+/// Shorthand for the counters a resident round reports to its call row.
+fn counts(
+    session_events: i64,
+    insert_count: i64,
+    draft_count: i64,
+) -> crate::store::ResidentCounts {
+    crate::store::ResidentCounts {
+        session_events,
+        turn_delta: session_events,
+        last_progress_idx: session_events,
+        insert_count,
+        draft_count,
+    }
+}
+
 async fn executor_fixture(dir: &tempfile::TempDir) -> (Arc<TurnExecutor>, Arc<SqliteStore>) {
     executor_fixture_with_budget(dir, 0).await
 }
@@ -1996,6 +2518,7 @@ async fn executor_fixture_full(
         image_describer: describer,
         hourly_call_budget,
         sticker_dir: dir.path().join("stickers"),
+        imagegen_dir: dir.path().join("imagegen"),
         agy_projects_dir: dir.path().join("projects"),
         secrets: Vec::new(),
         running_turns: Arc::new(RunningTurns::new()),
@@ -2017,6 +2540,894 @@ async fn executor_fixture_full(
         previous_batch: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
     (executor, store)
+}
+
+async fn seed_recovery_mcp_round(
+    executor: &Arc<TurnExecutor>,
+    id: &str,
+    valid: bool,
+) -> TurnResult {
+    let store = &executor.store;
+    let now = crate::now_unix();
+    let job = claimed_job(store, &[message(id, "u1", "hello", 0)]).await;
+    let group = store.get_group("1", "100").await.unwrap().unwrap();
+    let prepared = executor.prepare_turn(&job, &group, now).await.unwrap();
+    let call = store
+        .start_call("1", "100", &job.batch_id, now)
+        .await
+        .unwrap();
+    let coverage = ResidentCoverage {
+        batches: vec![ResidentDelivery {
+            batch_id: job.batch_id.clone(),
+            event_ids: job.event_ids.clone(),
+            newest: now,
+            privileged: false,
+        }],
+    };
+    let payload = if valid {
+        let token = prepared.turn_token.as_deref().unwrap();
+        let args = serde_json::json!({"turn_token":token,"should_reply":false});
+        let scope = crate::mcp::Scope {
+            bot_id: "1".into(),
+            group_id: "100".into(),
+        };
+        let response = crate::mcp::submit::call_submit(store, &scope, &args).await;
+        assert_eq!(response["isError"], false);
+        sqlx::query("UPDATE turn_submissions SET created_at = ? WHERE turn_token = ?")
+            .bind(now - 2)
+            .bind(token)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        match executor
+            .resident_submission_outcome(
+                &executor.resident,
+                &job,
+                &call,
+                &prepared,
+                counts(2, 0, 0),
+                &coverage,
+                false,
+                false,
+            )
+            .await
+        {
+            SubmissionOutcome::Commit(payload) => payload,
+            _ => panic!("expected buffered silent commit"),
+        }
+    } else {
+        // Exercise the finalizer's failed-validation arm, not an MCP acceptance.
+        String::new()
+    };
+    let timing = TurnTiming {
+        turn_started: std::time::Instant::now(),
+        agent_started: std::time::Instant::now(),
+    };
+    executor
+        .finish_resident_commit(
+            &executor.resident,
+            &job,
+            &call,
+            payload,
+            timing,
+            prepared,
+            coverage,
+            counts(2, 0, 0),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn seed_recovery_mcp_tenth_clean_round_clears_quarantine_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor).unwrap().output_channel = crate::config::OutputChannel::Mcp;
+    store
+        .record_seed_spawn("1", "100", "seed", 0, crate::now_unix())
+        .await
+        .unwrap();
+    store
+        .mark_seed_rejected("1", "100", crate::now_unix())
+        .await
+        .unwrap();
+    for round in 1..=10 {
+        assert_eq!(
+            seed_recovery_mcp_round(&executor, &format!("clean-{round}"), true).await,
+            TurnResult::Silent
+        );
+        let q = store
+            .get_seed_quarantine("1", "100")
+            .await
+            .unwrap()
+            .unwrap();
+        if round < 10 {
+            assert_eq!(q.clean_rounds, round, "exactly once per round");
+            assert_eq!(q.tier, 1);
+            assert_eq!(q.rejected_hash.as_deref(), Some("seed"));
+        } else {
+            assert_eq!(q.clean_rounds, 0);
+            assert_eq!(q.tier, 0);
+            assert_eq!(q.rejected_hash, None);
+        }
+    }
+    assert!(all_outbox_rows(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn seed_recovery_mcp_failure_does_not_advance_or_clear_quarantine() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor).unwrap().output_channel = crate::config::OutputChannel::Mcp;
+    store
+        .record_seed_spawn("1", "100", "seed", 0, crate::now_unix())
+        .await
+        .unwrap();
+    store
+        .mark_seed_rejected("1", "100", crate::now_unix())
+        .await
+        .unwrap();
+    assert_eq!(
+        seed_recovery_mcp_round(&executor, "clean-first", true).await,
+        TurnResult::Silent
+    );
+    assert_eq!(
+        seed_recovery_mcp_round(&executor, "invalid-next", false).await,
+        TurnResult::BadOutput
+    );
+    let q = store
+        .get_seed_quarantine("1", "100")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(q.clean_rounds, 1);
+    assert_eq!(q.tier, 1);
+    assert_eq!(q.rejected_hash.as_deref(), Some("seed"));
+    // Preserve the existing policy: seed rejection resets the clean counter.
+    store
+        .mark_seed_rejected("1", "100", crate::now_unix())
+        .await
+        .unwrap();
+    let q = store
+        .get_seed_quarantine("1", "100")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(q.clean_rounds, 0);
+    assert_eq!(q.tier, 2);
+    assert_eq!(
+        seed_recovery_mcp_round(&executor, "clean-after-reject", true).await,
+        TurnResult::Silent
+    );
+    assert_eq!(
+        store
+            .get_seed_quarantine("1", "100")
+            .await
+            .unwrap()
+            .unwrap()
+            .clean_rounds,
+        1
+    );
+}
+
+#[tokio::test]
+async fn persistence_duplicate_payloads_produce_one_committed_outbox() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor)
+        .expect("exclusive")
+        .output_channel = crate::config::OutputChannel::Mcp;
+    let job = claimed_job(&store, &[message("m1", "u1", "hello", 0)]).await;
+    let now = crate::now_unix();
+    let group = store
+        .get_group("1", "100")
+        .await
+        .expect("group")
+        .expect("exists");
+    let prepared = executor
+        .prepare_turn(&job, &group, now)
+        .await
+        .expect("prepare");
+    let token = prepared.turn_token.as_deref().expect("armed");
+    let args = serde_json::json!({"turn_token":token, "should_reply":true, "reply_parts":["收到"]});
+    let scope = crate::mcp::Scope {
+        bot_id: "1".into(),
+        group_id: "100".into(),
+    };
+    for _ in 0..2 {
+        let response = crate::mcp::submit::call_submit(&store, &scope, &args).await;
+        assert_eq!(response["isError"], false);
+    }
+    assert!(
+        all_outbox_rows(&store).await.is_empty(),
+        "tool calls only buffer"
+    );
+    sqlx::query("UPDATE turn_submissions SET created_at = ? WHERE turn_token = ?")
+        .bind(now - 2)
+        .bind(token)
+        .execute(store.pool())
+        .await
+        .expect("settle clock fixture");
+    let call = store
+        .start_call("1", "100", &job.batch_id, now)
+        .await
+        .expect("call");
+    let coverage = ResidentCoverage {
+        batches: vec![ResidentDelivery {
+            batch_id: job.batch_id.clone(),
+            event_ids: job.event_ids.clone(),
+            newest: now,
+            privileged: false,
+        }],
+    };
+    let result = executor
+        .resident_submission_outcome(
+            &executor.resident,
+            &job,
+            &call,
+            &prepared,
+            counts(2, 0, 0),
+            &coverage,
+            false,
+            false,
+        )
+        .await;
+    let SubmissionOutcome::Commit(payload) = result else {
+        panic!("expected one commit");
+    };
+    let timing = TurnTiming {
+        turn_started: std::time::Instant::now(),
+        agent_started: std::time::Instant::now(),
+    };
+    let _ = executor
+        .finish_resident_commit(
+            &executor.resident,
+            &job,
+            &call,
+            payload,
+            timing,
+            prepared,
+            coverage,
+            counts(2, 0, 0),
+        )
+        .await;
+    assert_eq!(all_outbox_rows(&store).await.len(), 1);
+    assert!(
+        store
+            .pending_for_group("1", "100")
+            .await
+            .expect("pending")
+            .is_empty()
+    );
+}
+
+/// 轮转只看会话累计步数：40 是业主定版阈值，本轮增量再大也不该提前触发。
+#[tokio::test]
+async fn rotation_uses_the_session_cumulative_count_at_the_frozen_limit() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (executor, store) = executor_fixture(&dir).await;
+    store
+        .set_conversation_id("1", "100", Some("conv-a"), crate::now_unix())
+        .await
+        .expect("conversation");
+    // 会话累计 39 步：还没到 40，不轮转。
+    executor
+        .rotate_after_delivered_round("100", 0, RESIDENT_STEP_ROTATE_LIMIT - 1)
+        .await;
+    assert_eq!(
+        conversation_of(&store).await,
+        Some("conv-a".to_string()),
+        "39 步不该轮转"
+    );
+    // 恰好 40 步：轮转。
+    executor
+        .rotate_after_delivered_round("100", 0, RESIDENT_STEP_ROTATE_LIMIT)
+        .await;
+    assert_eq!(conversation_of(&store).await, None, "40 步必须轮转");
+}
+
+async fn conversation_of(store: &SqliteStore) -> Option<String> {
+    store
+        .get_group("1", "100")
+        .await
+        .expect("group")
+        .expect("exists")
+        .agy_conversation_id
+}
+
+/// 一次交付只轮转一次：两个触发条件在同一处 OR 求值，不会被两套计数各打一遍。
+#[tokio::test]
+async fn one_delivered_round_rotates_at_most_once() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (executor, store) = executor_fixture(&dir).await;
+    store
+        .set_conversation_id("1", "100", Some("conv-a"), crate::now_unix())
+        .await
+        .expect("conversation");
+    let before = audit_actions(&store).await.len();
+    // 两个阈值同时满足。
+    executor
+        .rotate_after_delivered_round("100", 10_000, RESIDENT_STEP_ROTATE_LIMIT + 1)
+        .await;
+    let rotated: Vec<String> = audit_actions(&store)
+        .await
+        .into_iter()
+        .skip(before)
+        .filter(|a| a.contains("ops.conversation.rotated"))
+        .collect();
+    assert_eq!(rotated.len(), 1, "一轮只能记一条轮转：{rotated:?}");
+}
+
+async fn failed_resident_releases_coverage(reason: &str, inserted: bool) {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (executor, store) = executor_fixture(&dir).await;
+    let job = claimed_job(&store, &[message("original", "u1", "first", 0)]).await;
+    let insert = if inserted {
+        Some(claimed_job(&store, &[message("inserted", "u2", "second", 0)]).await)
+    } else {
+        None
+    };
+    let unrelated = claimed_job(&store, &[message("unrelated", "u3", "later", 0)]).await;
+    let bin = dir.path().join("agy");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '? for shortcuts\\n'\nexec sleep 60\n",
+    )
+    .expect("script");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let session = executor
+        .resident
+        .session("100", &workspace, None)
+        .await
+        .expect("session");
+    let call = store
+        .start_call("1", "100", &job.batch_id, crate::now_unix())
+        .await
+        .expect("call");
+    let coverage = ResidentCoverage {
+        batches: std::iter::once(&job)
+            .chain(insert.iter())
+            .map(|batch| ResidentDelivery {
+                batch_id: batch.batch_id.clone(),
+                event_ids: batch.event_ids.clone(),
+                newest: crate::now_unix(),
+                privileged: false,
+            })
+            .collect(),
+    };
+    let result = executor
+        .resident_fail(
+            &executor.resident,
+            &job,
+            &call,
+            &session,
+            reason,
+            TurnResult::AgentFailed,
+            &coverage,
+        )
+        .await;
+    executor.resident.close("100").await;
+    assert_eq!(result, TurnResult::AgentFailed);
+    let mut expected = job.event_ids.clone();
+    if let Some(insert) = insert {
+        expected.extend(insert.event_ids);
+    }
+    let actual: Vec<_> = store
+        .pending_for_group("1", "100")
+        .await
+        .expect("pending")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(actual, expected, "every covered row must be released");
+    assert!(!actual.iter().any(|id| unrelated.event_ids.contains(id)));
+    assert_eq!(
+        store.claim_batch(&actual, "retry").await.expect("reclaim"),
+        expected
+    );
+    assert!(
+        store
+            .claim_batch(&actual, "duplicate")
+            .await
+            .expect("second claim")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_resident_watchdog_releases_inserted_rows() {
+    failed_resident_releases_coverage("stall", true).await;
+}
+
+#[tokio::test]
+async fn failed_resident_poll_releases_inserted_rows() {
+    failed_resident_releases_coverage("poll_failed", true).await;
+}
+
+#[tokio::test]
+async fn failed_resident_hard_cap_releases_inserted_rows() {
+    failed_resident_releases_coverage("hard_cap", true).await;
+}
+
+#[tokio::test]
+async fn failed_resident_without_insert_releases_only_original_rows() {
+    failed_resident_releases_coverage("poll_failed", false).await;
+}
+
+#[tokio::test]
+async fn unconfirmed_insert_retires_session_before_retry() {
+    check_unconfirmed_insert(false, false).await;
+}
+
+#[tokio::test]
+async fn input_generation_unconfirmed_insert_never_reopens_submission_window() {
+    check_unconfirmed_insert(true, false).await;
+}
+
+#[tokio::test]
+async fn round_deadline_cancelled_insert_releases_unconfirmed_claim() {
+    check_unconfirmed_insert(true, true).await;
+}
+
+#[tokio::test]
+async fn input_generation_final_selection_uses_new_token_not_same_second_old_draft() {
+    check_input_generation_selection(true).await;
+}
+
+#[tokio::test]
+async fn input_generation_final_selection_refuses_stale_prepared_token() {
+    check_input_generation_selection(false).await;
+}
+
+async fn check_input_generation_selection(current: bool) {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor)
+        .expect("exclusive")
+        .output_channel = crate::config::OutputChannel::Mcp;
+    let job = claimed_job(&store, &[message("m1", "u1", "first", 0)]).await;
+    let now = crate::now_unix();
+    let group = store
+        .get_group("1", "100")
+        .await
+        .expect("group")
+        .expect("exists");
+    let mut prepared = executor
+        .prepare_turn(&job, &group, now)
+        .await
+        .expect("prepare");
+    let old = prepared.turn_token.as_deref().expect("token").to_owned();
+    store
+        .record_submission("100", &old, "old draft", "accepted", "", now - 2)
+        .await
+        .expect("old draft");
+    store
+        .arm_turn("100", "new", &job.batch_id, now, now + 600)
+        .await
+        .expect("confirmed insert");
+    store
+        .record_submission("100", "new", "new draft", "accepted", "", now - 2)
+        .await
+        .expect("new draft");
+    if current {
+        prepared.turn_token = Some("new".into());
+    }
+    let coverage = ResidentCoverage {
+        batches: vec![ResidentDelivery {
+            batch_id: job.batch_id.clone(),
+            event_ids: job.event_ids.clone(),
+            newest: now,
+            privileged: false,
+        }],
+    };
+    let call = store
+        .start_call("1", "100", &job.batch_id, now)
+        .await
+        .expect("call");
+    let result = executor
+        .resident_submission_outcome(
+            &executor.resident,
+            &job,
+            &call,
+            &prepared,
+            counts(2, 0, 1),
+            &coverage,
+            false,
+            false,
+        )
+        .await;
+    if current {
+        assert!(matches!(result, SubmissionOutcome::Commit(payload) if payload == "new draft"));
+    } else {
+        assert!(matches!(result, SubmissionOutcome::Wait));
+    }
+    assert!(all_outbox_rows(&store).await.is_empty());
+}
+
+struct ConfirmedInsertReader(std::path::PathBuf);
+
+#[async_trait::async_trait]
+impl crate::agent::resident::StepReader for ConfirmedInsertReader {
+    async fn read(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<crate::agent::step_stream::ParseResult, crate::agent::step_stream::ParseError> {
+        use crate::agent::step_stream::{ParseResult, StepEvent};
+        let text = std::fs::read_to_string(&self.0).unwrap_or_default();
+        let events = if text.contains("inserted request") {
+            vec![StepEvent {
+                idx: 1,
+                kind: "user".into(),
+                text,
+                tool: String::new(),
+                task_id: String::new(),
+                ts: None,
+                raw_type: 14,
+            }]
+        } else {
+            Vec::new()
+        };
+        Ok(ParseResult {
+            events,
+            other_counts: Default::default(),
+        })
+    }
+}
+
+async fn confirmed_input_fixture() -> (Arc<SqliteStore>, PreparedTurn, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut executor, store) = executor_fixture(&dir).await;
+    Arc::get_mut(&mut executor).unwrap().output_channel = crate::config::OutputChannel::Mcp;
+    let now = crate::now_unix();
+    assert_eq!(
+        store.ensure_member("1", "100", "555", now).await.unwrap(),
+        "u1"
+    );
+    assert_eq!(
+        store.ensure_member("1", "100", "777", now).await.unwrap(),
+        "u2"
+    );
+    let job = claimed_job(&store, &[message("original", "u1", "first", 0)]).await;
+    let mut group = store.get_group("1", "100").await.unwrap().unwrap();
+    group.resident_insert_enabled = true;
+    let mut prepared = executor.prepare_turn(&job, &group, now).await.unwrap();
+    let mut incoming = message("inserted", "u2", "inserted request", 0);
+    incoming.sender_id = "777".into();
+    incoming.received_at = now;
+    incoming.mentions_bot = true;
+    store
+        .insert_pending(
+            "1",
+            "100",
+            "inserted",
+            "777",
+            now,
+            &serde_json::to_string(&incoming).unwrap(),
+            "[]",
+        )
+        .await
+        .unwrap();
+    let bin = dir.path().join("insert-agy");
+    let inbox = dir.path().join("insert-inbox");
+    let home = dir.path().join("insert-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        &bin,
+        format!(
+            r#"#!/bin/sh
+printf '? for shortcuts\n'
+esc=$(printf '\033')
+conv="$HOME/.gemini/antigravity-cli/conversations"
+mkdir -p "$conv"
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | sed -e "s/${{esc}}\\[200~//g" -e "s/${{esc}}\\[201~//g")
+  printf '%s\n' "$line" >> '{}'
+  : > "$conv/00000000-0000-4000-8000-000000000001.db"
+done
+"#,
+            inbox.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = crate::agent::resident::ResidentConfig {
+        bin,
+        home,
+        workspace: dir.path().to_path_buf(),
+        model: "test".into(),
+        conversation_id: None,
+        deliver_timeout_s: 2,
+        memory_scope: None,
+    };
+    let session = Arc::new(
+        crate::agent::resident::ResidentSession::spawn(
+            &config,
+            "100",
+            Arc::new(ConfirmedInsertReader(inbox)),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut coverage = ResidentCoverage {
+        batches: vec![ResidentDelivery {
+            batch_id: job.batch_id.clone(),
+            event_ids: job.event_ids.clone(),
+            newest: 0,
+            privileged: false,
+        }],
+    };
+    let mut inserts = 0;
+    let result = executor
+        .try_resident_insert(
+            &executor.resident,
+            &session,
+            &mut coverage,
+            &mut prepared,
+            &group,
+            &mut inserts,
+            &mut None,
+            std::time::Instant::now(),
+            ResidentLimits {
+                insert_esc: false,
+                ..ResidentLimits::default()
+            },
+            &mut Vec::new(),
+        )
+        .await;
+    session.abort().await;
+    assert_eq!(
+        result,
+        Ok(Some(1)),
+        "fixture must confirm the reader's new user step"
+    );
+    assert_eq!(inserts, 1);
+    (store, prepared, dir)
+}
+
+#[tokio::test]
+async fn confirmed_input_new_member_can_request_image() {
+    let (store, prepared, _dir) = confirmed_input_fixture().await;
+    let result = crate::mcp::imagegen::call_generate(&store, &crate::mcp::Scope { bot_id: "1".into(), group_id: "100".into() },
+        &serde_json::json!({"turn_token":prepared.turn_token,"mode":"request","requester_ref":"u2","prompt":"draw a cat"})).await;
+    assert_eq!(
+        result["isError"], false,
+        "confirmed member denied: {result}"
+    );
+    let jobs = store.list_image_jobs("1", "100", 0, 10).await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].requester_id, "777");
+    assert_eq!(jobs[0].bucket, "request");
+}
+
+#[tokio::test]
+async fn confirmed_input_appends_message_refs_without_renumbering() {
+    let (_store, prepared, _dir) = confirmed_input_fixture().await;
+    assert_eq!(prepared.scope.message_refs, ["m1", "m2"]);
+    assert_eq!(prepared.scope.speaker_refs, ["u1", "u2"]);
+    assert_eq!(prepared.messages[0].message_id, "original");
+    assert_eq!(prepared.messages[1].message_id, "inserted");
+    assert_eq!(prepared.prompt_batch.messages[1].message_ref, "m2");
+    assert!(prepared.members.iter().any(|m| m.user_id == "777"));
+    let validated = crate::agent::contract::validate_value(&serde_json::json!({
+        "should_reply":true, "reply_text":"你刚才说的猫，我记下了", "quote_ref":"m2", "poke_ref":"u2"
+    }), &prepared.scope).unwrap();
+    assert_eq!(validated.output.quote_ref.as_deref(), Some("m2"));
+    assert_eq!(validated.output.poke_ref.as_deref(), Some("u2"));
+    let invalid = crate::agent::contract::validate_value(&serde_json::json!({
+        "should_reply":true, "reply_text":"你刚才说的猫，我记下了", "quote_ref":"m99", "poke_ref":"u99"
+    }), &prepared.scope).unwrap();
+    assert!(invalid.output.quote_ref.is_none());
+    assert!(invalid.output.poke_ref.is_none());
+}
+
+#[tokio::test]
+async fn confirmed_input_arm_rejects_foreign_ids_and_resets_coverage_on_new_turn() {
+    let (store, prepared, _dir) = confirmed_input_fixture().await;
+    let arm = store.armed_turn("100").await.unwrap().unwrap();
+    assert!(
+        store
+            .armed_sender_ids("1", "100", &arm.turn_token)
+            .await
+            .unwrap()
+            .contains(&"777".to_string())
+    );
+    store
+        .ensure_group("1", "200", crate::now_unix())
+        .await
+        .unwrap();
+    store
+        .insert_pending("1", "200", "foreign", "777", crate::now_unix(), "{}", "[]")
+        .await
+        .unwrap();
+    let foreign = store.pending_for_group("1", "200").await.unwrap()[0].id;
+    store
+        .claim_batch(&[foreign], "foreign-batch")
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .arm_confirmed_turn("1", &arm, &[foreign])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.armed_turn("100").await.unwrap().unwrap().turn_token,
+        prepared.turn_token.unwrap()
+    );
+    store
+        .arm_turn(
+            "100",
+            "next-turn",
+            &arm.batch_id,
+            arm.armed_at,
+            arm.expires_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .armed_sender_ids("1", "100", "next-turn")
+            .await
+            .unwrap(),
+        ["555"]
+    );
+}
+
+#[tokio::test]
+async fn confirmed_input_same_sender_in_another_group_cannot_use_token() {
+    let (store, prepared, _dir) = confirmed_input_fixture().await;
+    let now = crate::now_unix();
+    store.ensure_group("1", "200", now).await.unwrap();
+    store
+        .set_group_flags("1", "200", Some(true), Some(false), None, now)
+        .await
+        .unwrap();
+    store.ensure_member("1", "200", "777", now).await.unwrap();
+    let result = crate::mcp::imagegen::call_generate(&store, &crate::mcp::Scope { bot_id: "1".into(), group_id: "200".into() },
+        &serde_json::json!({"turn_token":prepared.turn_token,"mode":"request","requester_ref":"u1","prompt":"draw a cat"})).await;
+    assert_eq!(result["isError"], true);
+    assert!(
+        store
+            .list_image_jobs("1", "200", 0, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+async fn check_unconfirmed_insert(mcp: bool, deadline: bool) {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (mut executor, store) = executor_fixture(&dir).await;
+    if mcp {
+        Arc::get_mut(&mut executor)
+            .expect("exclusive")
+            .output_channel = crate::config::OutputChannel::Mcp;
+    }
+    let job = claimed_job(&store, &[message("original", "u1", "first", 0)]).await;
+    let mut group = store
+        .get_group("1", "100")
+        .await
+        .expect("group")
+        .expect("exists");
+    group.resident_insert_enabled = true;
+    let mut prepared = executor
+        .prepare_turn(&job, &group, crate::now_unix())
+        .await
+        .expect("prepare");
+    let incoming = claimed_job(&store, &[message("incoming", "u1", "second", 0)]).await;
+    store
+        .release_events(&incoming.event_ids)
+        .await
+        .expect("unclaim insert");
+    store
+        .set_conversation_id("1", "100", Some("uncertain"), crate::now_unix())
+        .await
+        .expect("conversation");
+    let bin = dir.path().join("agy");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '? for shortcuts\\n'\nexec sleep 60\n",
+    )
+    .expect("script");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let session = executor
+        .resident
+        .session("100", &workspace, None)
+        .await
+        .expect("session");
+    let mut coverage = ResidentCoverage {
+        batches: vec![ResidentDelivery {
+            batch_id: job.batch_id.clone(),
+            event_ids: job.event_ids.clone(),
+            newest: crate::now_unix(),
+            privileged: false,
+        }],
+    };
+    let started = std::time::Instant::now();
+    let mut insert_batches = Vec::new();
+    let mut inserts = 0;
+    let mut held = None;
+    let insertion = executor.try_resident_insert(
+        &executor.resident,
+        &session,
+        &mut coverage,
+        &mut prepared,
+        &group,
+        &mut inserts,
+        &mut held,
+        started,
+        ResidentLimits {
+            insert_esc: false,
+            ..ResidentLimits::default()
+        },
+        &mut insert_batches,
+    );
+    let result = if deadline {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), insertion)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            insert_batches.len(),
+            1,
+            "claim ownership must survive cancelled confirmation"
+        );
+        executor.expire_round(&job, &insert_batches).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "work plus bounded reap exceeded 4s"
+        );
+        assert!(all_outbox_rows(&store).await.is_empty());
+        Err(TurnResult::AgentFailed)
+    } else {
+        insertion.await
+    };
+    let retained = executor.resident.has_session("100").await;
+    executor.resident.close("100").await;
+    assert_eq!(result, Err(TurnResult::AgentFailed));
+    assert!(!retained, "uncertain session must not remain usable");
+    assert!(
+        store
+            .get_group("1", "100")
+            .await
+            .expect("group")
+            .expect("exists")
+            .agy_conversation_id
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .pending_for_group("1", "100")
+            .await
+            .expect("pending")
+            .into_iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        if deadline {
+            let mut ids = job.event_ids.clone();
+            ids.extend(&incoming.event_ids);
+            ids.sort_unstable();
+            ids
+        } else {
+            incoming.event_ids
+        }
+    );
+    assert_eq!(coverage.event_ids(), job.event_ids);
+    assert_eq!(prepared.scope.message_refs, ["m1"]);
+    assert_eq!(prepared.messages.len(), 1);
+    if mcp {
+        assert!(
+            store.armed_turn("100").await.expect("arm").is_none(),
+            "unconfirmed input must close the submission window"
+        );
+    }
 }
 
 /// Drive one turn the way the resident path does, but with the model's answer
@@ -2268,81 +3679,16 @@ async fn sticker_offers_prefer_distinct_emotions_over_a_high_scoring_tie() {
     assert!(hashes.contains(&"bbbb0004"), "offers: {offers:?}");
 }
 
-fn hashes(values: &[&str]) -> Vec<String> {
-    values.iter().map(|v| v.to_string()).collect()
-}
-
-#[test]
-fn only_the_last_three_rounds_count_as_just_sent() {
-    // Newest first, three rows in round "new", then round "mid", then round "old".
-    // A round is a batch, not a row: five parts of one delivery are one round.
-    let recent: Vec<(String, String, i64)> = vec![
-        ("h1".into(), "new".into(), 30),
-        ("h2".into(), "new".into(), 30),
-        ("h3".into(), "new".into(), 30),
-        ("h4".into(), "mid".into(), 20),
-        ("h5".into(), "old".into(), 10),
-    ];
-    let just = rounds_just_sent(&recent);
-    assert!(just.contains(&"h1".to_string()));
-    assert!(just.contains(&"h4".to_string()));
-    assert!(just.contains(&"h5".to_string()));
-    // The fourth round is out of scope, so nothing past it is claimed as recent.
-    let far: Vec<(String, String, i64)> = vec![
-        ("h1".into(), "a".into(), 40),
-        ("h2".into(), "b".into(), 30),
-        ("h3".into(), "c".into(), 20),
-        ("h9".into(), "d".into(), 10),
-    ];
-    assert!(!rounds_just_sent(&far).contains(&"h9".to_string()));
-}
-
-#[test]
-fn the_habit_slot_gives_way_to_a_fresh_candidate() {
-    let ranked = hashes(&["proven", "runner", "other"]);
-    let over = hashes(&["proven", "runner"]);
-    // Proven just went out, runner clears the threshold and has not: it wins.
-    let choice = habit_pick(&ranked, &hashes(&["proven"]), &over, &hashes(&["already"]));
-    assert_eq!(choice, Some("runner".to_string()));
-}
-
-#[test]
-fn the_habit_slot_keeps_the_proven_row_when_nothing_can_replace_it() {
-    let ranked = hashes(&["proven", "runner"]);
-    // Runner is over the threshold but also just went out, so it is no replacement.
-    let choice = habit_pick(
-        &ranked,
-        &hashes(&["proven", "runner"]),
-        &hashes(&["proven", "runner"]),
-        &[],
-    );
-    assert_eq!(
-        choice,
-        Some("proven".to_string()),
-        "no fresh option: the fallback still falls back"
-    );
-    // No history at all: no habit pick.
-    assert_eq!(habit_pick(&[], &[], &[], &[]), None);
-    // The proven row is already on the menu: the slot stays empty.
-    assert_eq!(
-        habit_pick(
-            &ranked,
-            &[],
-            &hashes(&["proven", "runner"]),
-            &hashes(&["proven"])
-        ),
-        None
-    );
-}
-
 #[tokio::test]
-async fn a_repeat_only_gets_offered_at_quarter_weight() {
+async fn a_sticker_sent_inside_the_cooldown_is_not_offered() {
     let dir = tempfile::tempdir().expect("tmp");
     let (executor, store) = executor_fixture(&dir).await;
     seed_library_row(&store, "aaaa1111bbbb", "", "无语", "被噎住时", true).await;
     seed_library_row(&store, "eeee5555ffff", "", "无语", "被噎住时", true).await;
-    // Only one of the two just went out, so only one of them is damped. Both rows
-    // score identically on the batch text, which makes the ordering the damping.
+    // Only one of the two just went out. Both rows score identically on the
+    // batch text, so under A5 the sent one still made the menu at quarter
+    // weight; under A6 it is inside the cooldown and stays off the menu
+    // while a fresh equal match exists.
     sqlx::query(
             "INSERT INTO outbox (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at) \
              VALUES ('o-aa', '1', '100', 'b', '', 'sent', 'sticker', 'aaaa1111bbbb', 1, 1)",
@@ -2351,104 +3697,16 @@ async fn a_repeat_only_gets_offered_at_quarter_weight() {
         .await
         .expect("outbox");
 
-    // Both cleared the threshold; the damped one still clears it at quarter weight, so
-    // it stays on the menu — a discount is not a ban.
     let messages = vec![message("m1", "u1", "无语 被噎住时", 0)];
     let offers = executor
         .select_sticker_offers(&["无语 被噎住时".to_string()], &messages)
         .await;
     let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
-    assert!(
-        hashes.contains(&"aaaa1111bbbb"),
-        "quarter weight still offers it: {hashes:?}"
-    );
-    // And the un-damped row comes first.
-    assert_eq!(hashes[0], "eeee5555ffff", "offers: {hashes:?}");
+    assert_eq!(hashes, ["eeee5555ffff"], "offers: {hashes:?}");
 }
 
 #[tokio::test]
-async fn a_habit_pick_with_no_fresh_replacement_still_comes_along() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let (executor, store) = executor_fixture(&dir).await;
-    // Two rows share the "无语" bucket so the diverse pass picks exactly one and
-    // leaves room for the habit slot.
-    seed_library_row(&store, "aaaa1111bbbb", "", "无语", "被噎住时", true).await;
-    seed_library_row(&store, "cccc2222dddd", "", "无语", "被噎住时", true).await;
-    seed_library_row(&store, "dddd3333eeee", "", "得意", "炫耀时", true).await;
-    // The group sends cccc most, then dddd, and all three deliveries fall inside the
-    // last three rounds — so neither can replace the other.
-    for (id, hash, batch) in [
-        ("o-cc-1", "cccc2222dddd", "old"),
-        ("o-cc-2", "cccc2222dddd", "older"),
-        ("o-dd-1", "dddd3333eeee", "newest"),
-    ] {
-        sqlx::query(
-                "INSERT INTO outbox (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at) \
-                 VALUES (?, '1', '100', ?, '', 'sent', 'sticker', ?, 1, 1)",
-            )
-            .bind(id)
-            .bind(batch)
-            .bind(hash)
-            .execute(store.pool())
-            .await
-            .expect("outbox");
-    }
-
-    // aaaa scores on the batch text, cccc is the habit pick but just went out,
-    // dddd is the runner-up and also just went out — so nothing replaces it and the
-    // proven row keeps the slot (the "无替代时照旧保底" case).
-    let messages = vec![message("m1", "u1", "被噎住时", 0)];
-    let offers = executor
-        .select_sticker_offers(&["被噎住时".to_string()], &messages)
-        .await;
-    let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
-    assert!(
-        hashes.contains(&"cccc2222dddd"),
-        "no replacement: proven row still rides along: {hashes:?}"
-    );
-}
-
-#[tokio::test]
-async fn the_habit_slot_skips_a_row_the_group_just_saw() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let (executor, store) = executor_fixture(&dir).await;
-    seed_library_row(&store, "aaaa1111bbbb", "", "无语", "被噎住时", true).await;
-    seed_library_row(&store, "cccc2222dddd", "", "无语", "被噎住时", true).await;
-    seed_library_row(&store, "dddd3333eeee", "", "无语", "被噎住时", true).await;
-    // cccc is the group's habit, but it went out in the newest round; dddd went out
-    // long before that. So dddd is the fresher over-threshold row.
-    for (id, hash, batch, at) in [
-        ("o-cc-1", "cccc2222dddd", "newest", 100),
-        ("o-cc-2", "cccc2222dddd", "older", 50),
-        ("o-dd-1", "dddd3333eeee", "ancient", 1),
-    ] {
-        sqlx::query(
-                "INSERT INTO outbox (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at) \
-                 VALUES (?, '1', '100', ?, '', 'sent', 'sticker', ?, ?, ?)",
-            )
-            .bind(id)
-            .bind(batch)
-            .bind(hash)
-            .bind(at)
-            .bind(at)
-            .execute(store.pool())
-            .await
-            .expect("outbox");
-    }
-
-    let messages = vec![message("m1", "u1", "被噎住时", 0)];
-    let offers = executor
-        .select_sticker_offers(&["被噎住时".to_string()], &messages)
-        .await;
-    let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
-    assert!(
-        hashes.contains(&"dddd3333eeee"),
-        "the fresh runner-up takes the slot: {hashes:?}"
-    );
-}
-
-#[tokio::test]
-async fn sticker_offers_append_the_groups_most_sent_row_when_there_is_room() {
+async fn sticker_offers_do_not_append_an_unscored_habit_row() {
     let dir = tempfile::tempdir().expect("tmp");
     let (executor, store) = executor_fixture(&dir).await;
     seed_library_row(&store, "aaaa1111bbbb", "", "无语", "被噎住时", true).await;
@@ -2471,29 +3729,231 @@ async fn sticker_offers_append_the_groups_most_sent_row_when_there_is_room() {
         .await
         .expect("outbox");
 
-    // One scored match leaves room for the habit pick.
+    // One scored match, and room to spare: the group's most-sent row no
+    // longer rides along unscored (the A4 habit slot is gone in A6). The
+    // scored row itself went out inside the cooldown, so neither it nor
+    // the unrelated habitual row can enter the menu.
     let messages = vec![message("m1", "u1", "无语 被噎住时", 0)];
     let offers = executor
         .select_sticker_offers(&["无语 被噎住时".to_string()], &messages)
         .await;
     let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
-    assert_eq!(hashes.len(), 2, "offers: {offers:?}");
-    assert_eq!(hashes[0], "aaaa1111bbbb");
-    assert_eq!(hashes[1], "cccc2222dddd", "habit pick goes last");
+    assert!(hashes.is_empty(), "offers: {offers:?}");
 
-    // Nothing scored: no habit pick either — an unrelated batch stays unrelated.
+    // Nothing scored: no offers either — an unrelated batch stays unrelated.
     let quiet = vec![message("m2", "u1", "量子力学考试范围", 0)];
     let none = executor.select_sticker_offers(&[], &quiet).await;
     assert!(none.is_empty(), "offers: {none:?}");
 
-    // Already picked by score: never duplicated by the habit slot.
+    // The habitual row also stays excluded when it becomes the scored pick.
     let hit = vec![message("m3", "u1", "得意 炫耀时", 0)];
     let offers = executor
         .select_sticker_offers(&["得意 炫耀时".to_string()], &hit)
         .await;
     let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
-    assert_eq!(hashes.len(), 1, "offers: {offers:?}");
-    assert_eq!(hashes.iter().filter(|h| **h == "cccc2222dddd").count(), 1);
+    assert!(hashes.is_empty(), "offers: {offers:?}");
+}
+
+fn offer_record(hash: &str) -> crate::store::StickerRecord {
+    crate::store::StickerRecord {
+        hash: hash.to_string(),
+        bot_id: "1".into(),
+        group_id: "2".into(),
+        file_path: String::new(),
+        kind: "sticker".into(),
+        is_self: "other".into(),
+        ocr: String::new(),
+        description: String::new(),
+        scene: String::new(),
+        emotion: String::new(),
+        intent: String::new(),
+        usage_hint: String::new(),
+        search_blob: String::new(),
+        phash: None,
+        last_seen_at: None,
+        seen_count: 1,
+        nsfw: false,
+        enabled: true,
+        kept: crate::store::KEPT_YES,
+        created_at: 0,
+    }
+}
+
+#[test]
+fn offer_ranking_excludes_the_cooldown_while_fresh_rows_remain() {
+    let champ = offer_record("champ");
+    let fresh = offer_record("fresh");
+    let raw = vec![(2.0, &champ), (1.0, &fresh)];
+    let counts = std::collections::HashMap::from([("champ".to_string(), 30)]);
+    let ranked = rank_offer_candidates(&raw, &["champ".to_string()], &counts);
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].1.hash, "fresh");
+    assert_eq!(ranked[0].0, 1.0);
+}
+
+#[test]
+fn offer_ranking_never_falls_back_when_everything_is_cooled() {
+    let champ = offer_record("champ");
+    let raw = vec![(2.0, &champ)];
+    let ranked = rank_offer_candidates(
+        &raw,
+        &["champ".to_string()],
+        &std::collections::HashMap::new(),
+    );
+    assert!(ranked.is_empty());
+}
+
+#[test]
+fn offer_a6_all_cooled_candidates_leave_an_empty_menu() {
+    let left = offer_record("left");
+    let right = offer_record("right");
+    assert!(
+        rank_offer_candidates(
+            &[(100.0, &left), (100.0, &right)],
+            &["left".into(), "right".into()],
+            &std::collections::HashMap::new(),
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn offer_a6_all_divided_scores_below_threshold_leave_an_empty_menu() {
+    let left = offer_record("left");
+    let right = offer_record("right");
+    let counts = std::collections::HashMap::from([("left".into(), 100), ("right".into(), 100)]);
+    assert!(rank_offer_candidates(&[(1.0, &left), (1.0, &right)], &[], &counts).is_empty());
+}
+
+#[tokio::test]
+async fn offer_a6_twenty_and_hundred_send_boundaries_are_exact() {
+    assert_eq!(OFFER_COOLDOWN_SENDS, 20);
+    assert_eq!(RECENT_SEND_SCAN_LIMIT, 100);
+    for (position, expected) in [
+        (20, vec!["zzzz5555ffff"]),
+        (21, vec!["zzzz5555ffff", "aaaa1111bbbb"]),
+        (100, vec!["zzzz5555ffff", "aaaa1111bbbb"]),
+        (101, vec!["aaaa1111bbbb", "zzzz5555ffff"]),
+    ] {
+        let dir = tempfile::tempdir().expect("tmp");
+        let (executor, store) = executor_fixture(&dir).await;
+        for hash in ["aaaa1111bbbb", "zzzz5555ffff"] {
+            seed_library_row(&store, hash, "", "无语", "被噎住时", true).await;
+        }
+        for rank in 1..=101 {
+            let hash = if rank == position {
+                "aaaa1111bbbb"
+            } else {
+                "filler"
+            };
+            sqlx::query("INSERT INTO outbox
+                (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at)
+                VALUES (?, '1', '100', 'b', '', 'sent', 'sticker', ?, ?, ?)")
+                .bind(format!("send-{rank}")).bind(hash).bind(102 - rank).bind(102 - rank)
+                .execute(store.pool()).await.expect("outbox");
+        }
+        let offers = executor
+            .select_sticker_offers(
+                &["无语 被噎住时".into()],
+                &[message("m1", "u1", "无语 被噎住时", 0)],
+            )
+            .await;
+        let hashes: Vec<_> = offers.iter().map(|offer| offer.hash.as_str()).collect();
+        assert_eq!(hashes, expected, "position {position}");
+    }
+}
+
+#[test]
+fn offer_ranking_divides_by_usage() {
+    let used = offer_record("used");
+    let fresh = offer_record("fresh");
+    let raw = vec![(1.2, &used), (1.2, &fresh)];
+    let counts = std::collections::HashMap::from([("used".to_string(), 3)]);
+    let ranked = rank_offer_candidates(&raw, &[], &counts);
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0].1.hash, "fresh");
+    assert!((ranked[0].0 - 1.2).abs() < 1e-9);
+    assert_eq!(ranked[1].1.hash, "used");
+    assert!((ranked[1].0 - 0.3).abs() < 1e-9, "score {}", ranked[1].0);
+}
+
+#[test]
+fn offer_ranking_drops_a_used_row_the_divisor_pushes_under_the_bar() {
+    let used = offer_record("used");
+    let fresh = offer_record("fresh");
+    let raw = vec![(0.3, &used), (1.0, &fresh)];
+    let counts = std::collections::HashMap::from([("used".to_string(), 3)]);
+    let ranked = rank_offer_candidates(&raw, &[], &counts);
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].1.hash, "fresh");
+}
+
+#[tokio::test]
+async fn a_cooled_sticker_is_not_offered_even_when_nothing_fresh_matches() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (executor, store) = executor_fixture(&dir).await;
+    seed_library_row(&store, "aaaa1111bbbb", "", "无语", "被噎住时", true).await;
+    sqlx::query(
+            "INSERT INTO outbox (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at) \
+             VALUES ('o-aa', '1', '100', 'b', '', 'sent', 'sticker', 'aaaa1111bbbb', 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("outbox");
+
+    // The hard cooldown takes precedence over filling the offer menu.
+    let messages = vec![message("m1", "u1", "无语 被噎住时", 0)];
+    let offers = executor
+        .select_sticker_offers(&["无语 被噎住时".to_string()], &messages)
+        .await;
+    let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
+    assert!(hashes.is_empty(), "offers: {hashes:?}");
+}
+
+#[tokio::test]
+async fn an_equal_match_sent_more_often_ranks_lower_once_cooled_off() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let (executor, store) = executor_fixture(&dir).await;
+    seed_library_row(&store, "aaaa1111bbbb", "", "无语", "被噎住时", true).await;
+    seed_library_row(&store, "eeee5555ffff", "", "无语", "被噎住时", true).await;
+    // aaaa went out twice, then twenty-three other sends pushed it out of
+    // the cooldown window (the newest twenty sends) while keeping it inside
+    // the hundred-send window the frequency divisor reads.
+    for (id, at) in [("o-aa-1", 1), ("o-aa-2", 2)] {
+        sqlx::query(
+                "INSERT INTO outbox (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at) \
+                 VALUES (?, '1', '100', 'b', '', 'sent', 'sticker', 'aaaa1111bbbb', ?, ?)",
+            )
+            .bind(id)
+            .bind(at)
+            .bind(at)
+            .execute(store.pool())
+            .await
+            .expect("outbox");
+    }
+    for index in 0..23 {
+        sqlx::query(
+                "INSERT INTO outbox (id, bot_id, group_id, batch_id, text, state, kind, sticker_hash, created_at, updated_at) \
+                 VALUES (?, '1', '100', 'b', '', 'sent', 'sticker', 'ffff9999xxxx', ?, ?)",
+            )
+            .bind(format!("o-fill-{index}"))
+            .bind(10 + index)
+            .bind(10 + index)
+            .execute(store.pool())
+            .await
+            .expect("outbox");
+    }
+
+    let messages = vec![message("m1", "u1", "无语 被噎住时", 0)];
+    let offers = executor
+        .select_sticker_offers(&["无语 被噎住时".to_string()], &messages)
+        .await;
+    let hashes: Vec<&str> = offers.iter().map(|o| o.hash.as_str()).collect();
+    assert_eq!(
+        hashes,
+        ["eeee5555ffff", "aaaa1111bbbb"],
+        "offers: {hashes:?}"
+    );
 }
 
 // ------------------------------------------------- server-side auto-collection

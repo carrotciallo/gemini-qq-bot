@@ -225,6 +225,9 @@ impl Session {
             {
                 tools.extend(extra.iter().cloned());
             }
+            if !self.submit_only {
+                tools.push(crate::mcp::imagegen::tool_definition());
+            }
             tools.push(submit::tool_definition());
             self.audit_wire(
                 store,
@@ -316,6 +319,9 @@ impl Session {
             }
             stickers::KEEP_TOOL => {
                 stickers::call_keep(store, &scope.bot_id, Some(&scope.group_id), &args).await
+            }
+            crate::mcp::imagegen::TOOL_NAME => {
+                crate::mcp::imagegen::call_generate(store, &scope, &args).await
             }
             submit::TOOL_NAME => submit::call_submit(store, &scope, &args).await,
             _ => return memory::handle(store, &scope, frame).await,

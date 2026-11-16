@@ -493,6 +493,156 @@ async fn a_killed_child_surfaces_as_a_crash() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn lifecycle_repeated_close_reaps_groups_and_returns_fds() {
+    use crate::process::test_support::*;
+    const FLAG: &str = "ASTRA_LIFECYCLE_FD_PROBE";
+    if std::env::var_os(FLAG).is_none() {
+        // Subreaper state and waitpid(-1) are confined to a single-test process,
+        // so this cannot steal another concurrently running test's child.
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::resident::tests::lifecycle_repeated_close_reaps_groups_and_returns_fds",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FLAG, "1")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(45), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let bin = dir.path().join("agy");
+    executable(
+        &bin,
+        "#!/bin/sh\ntrap '' HUP\nsh -c 'trap \"\" HUP TERM; exec sleep 60' &\nprintf '? for shortcuts\\n'\nwhile IFS= read -r line; do case \"$line\" in /exit*) exit 0;; esac; done\n",
+    );
+    let config = session_config(dir.path(), bin, home, work);
+    let mut unrelated = tokio::process::Command::new("/bin/sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let fd_count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let mut baseline = None;
+    // One warmup followed by three complete close/rebirth cycles.
+    for _ in 0..4 {
+        let reader = Arc::new(InboxReader::new(dir.path().join("inbox"), None));
+        let session = ResidentSession::spawn(&config, "fd", reader).await.unwrap();
+        let pgid = session.pid().await.unwrap() as i32;
+        session.close().await;
+        drop(session);
+        let mut absent = false;
+        for _ in 0..100 {
+            crate::process::reaper::reap_orphaned_children();
+            absent = matches!(
+                nix::sys::signal::killpg(Pid::from_raw(pgid), None),
+                Err(nix::errno::Errno::ESRCH)
+            );
+            if absent {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(absent, "owned process group remains, including zombies");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        if let Some(initial) = baseline {
+            assert!(
+                fd_count() <= initial + 1,
+                "PTY descriptors grew after rebirth"
+            );
+        } else {
+            baseline = Some(fd_count());
+        }
+    }
+    assert!(
+        unrelated.try_wait().unwrap().is_none(),
+        "cleanup killed an unrelated process"
+    );
+    unrelated.kill().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn lifecycle_close_kills_descendant_after_leader_exits_ignoring_term() {
+    use crate::process::test_support::*;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let bin = dir.path().join("agy");
+    let descendant_file = dir.path().join("descendant.pid");
+    executable(
+        &bin,
+        &format!(
+            "#!/bin/sh\ntrap '' HUP\nsh -c 'trap \"\" HUP TERM; echo $$ > {}; exec sleep 60' &\nprintf '? for shortcuts\\n'\nwhile IFS= read -r line; do case \"$line\" in /exit*) exit 0;; esac; done\n",
+            descendant_file.display()
+        ),
+    );
+    let reader = Arc::new(InboxReader::new(dir.path().join("inbox"), None));
+    let session =
+        ResidentSession::spawn(&session_config(dir.path(), bin, home, work), "life", reader)
+            .await
+            .unwrap();
+    let child = pid_file(&descendant_file).await;
+    assert!(live(child));
+    session.close().await;
+    let gone = stopped(child).await;
+    cleanup(child);
+    assert!(gone, "TERM-ignoring descendant survived the reaped leader");
+    assert!(session.inner.lock().await.reaped);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn lifecycle_cancel_onboarding_reaps_the_owned_process() {
+    use crate::process::test_support::*;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let bin = dir.path().join("agy");
+    let pid_path = dir.path().join("leader.pid");
+    executable(
+        &bin,
+        &format!(
+            "#!/bin/sh\ntrap '' HUP TERM\necho $$ > {}\nexec sleep 60\n",
+            pid_path.display()
+        ),
+    );
+    let config = session_config(dir.path(), bin, home, work);
+    let reader = Arc::new(InboxReader::new(dir.path().join("inbox"), None));
+    let task = tokio::spawn(async move { ResidentSession::spawn(&config, "cancel", reader).await });
+    let pid = pid_file(&pid_path).await;
+    task.abort();
+    assert!(matches!(task.await, Err(err) if err.is_cancelled()));
+    let gone = stopped(pid).await;
+    cleanup(pid);
+    assert!(gone, "cancelled bootstrap left its process alive");
+    for _ in 0..100 {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("cancelled bootstrap left an unreaped leader");
+}
+
 #[tokio::test]
 async fn pinned_paused_session_is_reclaimed_after_the_window() {
     let (_dir, session, _reader) = start(false, None).await;
@@ -502,6 +652,101 @@ async fn pinned_paused_session_is_reclaimed_after_the_window() {
         session
             .reclaim_if_idle(Some(1_000), 1_000 + PAUSED_RECLAIM_SECONDS + 1)
             .await
+    );
+}
+
+#[tokio::test]
+async fn watchdog_new_delivery_resets_a_long_idle_clock() {
+    let (_dir, session, _reader) = start(false, None).await;
+    session.inner.lock().await.last_progress =
+        Instant::now() - ACTIVE_STALL - Duration::from_secs(1);
+    session
+        .deliver("a fresh turn after long idle")
+        .await
+        .unwrap();
+    let age = session.inner.lock().await.last_progress.elapsed();
+    session.close().await;
+    assert!(
+        age < Duration::from_secs(5),
+        "new delivery inherited idle age: {age:?}"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_does_not_treat_pre_paste_ready_as_current() {
+    let (_dir, session, _reader) = start(false, None).await;
+    assert!(session.screen_text().contains(AGY_READY_MARKER));
+    session
+        .deliver("now generating without a new ready marker")
+        .await
+        .unwrap();
+    session.inner.lock().await.last_progress =
+        Instant::now() - ACTIVE_STALL - Duration::from_secs(1);
+    let result = session.tick(true).await;
+    session.close().await;
+    assert!(
+        matches!(result, Err(ResidentError::Crash(_))),
+        "historical ready hid the stall: {result:?}"
+    );
+}
+
+#[test]
+fn watchdog_progress_covers_equal_length_text_and_tool_changes() {
+    let event = StepEvent {
+        idx: 1,
+        kind: "agent_text".into(),
+        text: "alpha".into(),
+        tool: String::new(),
+        task_id: String::new(),
+        ts: Some(1.0),
+        raw_type: 15,
+    };
+    let before = progress_signal(&[event.clone()]);
+    let mut changed = event.clone();
+    changed.text = "bravo".into();
+    assert_ne!(before, progress_signal(&[changed]));
+    let mut changed = event.clone();
+    changed.tool = "completed".into();
+    assert_ne!(before, progress_signal(&[changed]));
+    let mut changed = event.clone();
+    changed.task_id = "next-task".into();
+    assert_ne!(before, progress_signal(&[changed]));
+    let mut timestamp_only = event;
+    timestamp_only.ts = Some(99.0);
+    assert_eq!(
+        before,
+        progress_signal(&[timestamp_only]),
+        "timestamp noise is not business progress"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_real_silence_expires_but_idle_sessions_do_not() {
+    let (_dir, session, _reader) = start(false, None).await;
+    session.screen.lock().unwrap().clear();
+    session.inner.lock().await.last_progress =
+        Instant::now() - ACTIVE_STALL - Duration::from_secs(1);
+    assert!(session.tick(false).await.is_ok());
+    let result = session.tick(true).await;
+    assert!(matches!(result, Err(ResidentError::Crash(_))));
+    assert!(matches!(session.state().await, SessionState::Dead(_)));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn watchdog_interrupt_requires_ready_from_the_current_generation() {
+    let (_dir, session, _reader) = start(false, None).await;
+    session
+        .deliver("generation without a new ready marker")
+        .await
+        .unwrap();
+    let result = session
+        .interrupt_generation(Duration::from_millis(100))
+        .await;
+    session.close().await;
+    assert!(
+        matches!(result, Err(ResidentError::DeliverUnconfirmed(_))),
+        "old ready must not acknowledge ESC: {result:?}"
     );
 }
 

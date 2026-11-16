@@ -435,7 +435,7 @@ impl DigestEngine {
             .await
             .ok()
             .flatten()
-            .map(|s| s.summary_text);
+            .map(|s| crate::memory::compaction::summary_display_text(&s.summary_text));
         let request = DigestRequest {
             entries: entries.clone(),
             summary,
@@ -512,11 +512,19 @@ impl DigestEngine {
         messages: &[crate::onebot::normalize::IncomingMessage],
         expansion: Option<&str>,
     ) -> MemoryContext {
-        let memories = self
+        let mut memories = self
             .store
             .list_memories(&self.bot_id, group_id, 500)
             .await
             .unwrap_or_default();
+        // Sealed topics ([seal-4]): same retrieval exclusion as the turn
+        // path — a sealed row must not surface through the digest either.
+        let sealed = self
+            .store
+            .list_sealed_topics(&self.bot_id, group_id)
+            .await
+            .unwrap_or_default();
+        crate::memory::sealed::retain_unsealed(&mut memories, &sealed);
         let members = self
             .store
             .list_members(&self.bot_id, group_id)
@@ -543,6 +551,7 @@ impl DigestEngine {
             speaker_refs: &speaker_refs,
             subject_aliases: &aliases,
             budget: self.budget,
+            now: crate::now_unix(),
         })
     }
 
@@ -584,8 +593,14 @@ mod tests {
         ContextMemory {
             memory_ref: ref_.into(),
             subject_ref: Some("u1".into()),
+            subject: crate::memory::schema::SubjectV1 {
+                subject_type: "user".into(),
+                alias: "u1".into(),
+            },
             content: content.into(),
             kind: "fact".into(),
+            slot: String::new(),
+            tags: Vec::new(),
             score: 1.0,
             recent: false,
         }

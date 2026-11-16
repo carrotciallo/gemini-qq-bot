@@ -3,7 +3,12 @@
 //! The aux layer always has exactly one provider (the operator's dual-mode
 //! design): the gateway when it is enabled, otherwise one dedicated Agy
 //! session. The settings API can swap the provider at runtime: consumers
-//! hold the slot (as [`AuxLlm`] / [`SummaryModel`]) and never rewire.
+//! hold the slot (as [`AuxLlm`]) and never rewire.
+//!
+//! The provider still bundles a [`SummaryModel`] face, but since memfix
+//! [mf-2] nothing routes memory work through it: summaries run on a
+//! dedicated Agy session built in `App::new`. The bundled face remains for
+//! the fallback design (and its tests), not for production memory traffic.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};

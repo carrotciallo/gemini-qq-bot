@@ -11,7 +11,11 @@
 //! [`BotError::MemoryArchived`]. That refusal is a per-op outcome, not a batch failure:
 //! one stale ref must not cost the turn its other writes.
 //!
-//! `Delete` is deliberately absent: deletion is an operator action on the panel.
+//! Hard deletion stays an operator action on the panel. What the agent gets
+//! instead (memfix [mf-1]) are state transitions: `Update` supersedes the old
+//! row with a corrected successor (the old row keeps a `superseded_by`
+//! pointer), and `Retire` closes a row that no longer holds. Both keep the
+//! row in the database for audit and panel restore.
 
 use std::sync::Arc;
 
@@ -24,12 +28,17 @@ use crate::store::SqliteStore;
 pub enum ApplyOutcome {
     /// A new memory row with this ref was created.
     Added(String),
-    /// An existing memory row was updated.
+    /// The target row was superseded by a successor row with this ref.
     Updated(String),
+    /// The target row was retired (closed, kept for audit).
+    Retired(String),
     /// The ref did not belong to this group (defence in depth).
     RejectedOutOfScope,
     /// The ref points at a retired row. Refused, and never revived.
     RejectedArchived(String),
+    /// The op is about a topic the operator has sealed for this group
+    /// ([seal-2]). Defence in depth behind contract validation.
+    RejectedSealed,
 }
 
 /// Applies memory proposals for one group.
@@ -84,11 +93,32 @@ impl MemoryApplier {
             .collect();
         let source_ids = serde_json::to_string(&resolved).unwrap_or_else(|_| "[]".into());
 
+        // Add/update must not treat an unavailable operator constraint as an
+        // empty constraint. Retiring an existing fact cannot revive a topic and
+        // remains independent of this read.
+        let sealed = if matches!(op.op, MemoryOpKind::Retire) {
+            Vec::new()
+        } else {
+            self.store
+                .list_sealed_topics(bot_id, group_id)
+                .await
+                .map_err(|_| BotError::Message("sealed_topics_unavailable".into()))?
+        };
+
         match op.op {
             MemoryOpKind::Add => {
+                let v1 = crate::memory::schema::MemoryV1Fields {
+                    slot: op.slot.clone().unwrap_or_default(),
+                    tags: op.tags.clone(),
+                    ttl: op.ttl,
+                    expires_override: None,
+                };
+                if crate::memory::sealed::hit(&sealed, &v1.slot, &op.content).is_some() {
+                    return Ok(ApplyOutcome::RejectedSealed);
+                }
                 let memory_ref = self
                     .store
-                    .insert_memory_with_origin(
+                    .insert_memory_v1(
                         bot_id,
                         group_id,
                         subject_user_id.as_deref(),
@@ -97,6 +127,7 @@ impl MemoryApplier {
                         &source_ids,
                         op.confidence,
                         self.origin,
+                        &v1,
                         now,
                     )
                     .await?;
@@ -112,24 +143,48 @@ impl MemoryApplier {
                     Some(row) if row.is_archived() => {
                         Ok(ApplyOutcome::RejectedArchived(target.to_string()))
                     }
-                    Some(_) => {
-                        // An applied agent update endorses the row, so provenance flips
-                        // to `agy` even when hy3 originally extracted it.
+                    Some(row) => {
+                        // An agent update supersedes the row (memfix [mf-1]): the
+                        // successor is written under `agy` provenance even when hy3
+                        // originally extracted the fact, and the old row closes
+                        // with a pointer to it. v1 fields merge onto the row's:
+                        // the op only overrides what it actually carried, and
+                        // without an explicit ttl the old expiry is kept exactly
+                        // instead of rematerialising the kind default.
+                        let v1 = crate::memory::schema::MemoryV1Fields {
+                            slot: op.slot.clone().unwrap_or_else(|| row.slot.clone()),
+                            tags: if op.tags.is_empty() {
+                                row.tags.clone()
+                            } else {
+                                op.tags.clone()
+                            },
+                            ttl: op.ttl,
+                            expires_override: if op.ttl.is_none() {
+                                Some(row.expires_at)
+                            } else {
+                                None
+                            },
+                        };
+                        if crate::memory::sealed::hit(&sealed, &v1.slot, &op.content).is_some() {
+                            return Ok(ApplyOutcome::RejectedSealed);
+                        }
                         match self
                             .store
-                            .update_memory_with_origin(
+                            .supersede_memory(
                                 bot_id,
                                 group_id,
                                 target,
                                 &op.content,
                                 op.confidence,
-                                Some(self.origin),
+                                self.origin,
+                                &v1,
+                                &source_ids,
                                 now,
                             )
                             .await
                         {
-                            Ok(true) => Ok(ApplyOutcome::Updated(target.to_string())),
-                            Ok(false) => Ok(ApplyOutcome::RejectedOutOfScope),
+                            Ok(Some(new_ref)) => Ok(ApplyOutcome::Updated(new_ref)),
+                            Ok(None) => Ok(ApplyOutcome::RejectedOutOfScope),
                             // The row was retired between the read and the write.
                             Err(BotError::MemoryArchived(_)) => {
                                 Ok(ApplyOutcome::RejectedArchived(target.to_string()))
@@ -137,6 +192,27 @@ impl MemoryApplier {
                             Err(e) => Err(e),
                         }
                     }
+                }
+            }
+            MemoryOpKind::Retire => {
+                let Some(target) = op.memory_ref.as_deref() else {
+                    return Ok(ApplyOutcome::RejectedOutOfScope);
+                };
+                match self.store.memory_by_ref(bot_id, group_id, target).await? {
+                    None => Ok(ApplyOutcome::RejectedOutOfScope),
+                    Some(row) if row.is_archived() => {
+                        Ok(ApplyOutcome::RejectedArchived(target.to_string()))
+                    }
+                    Some(_) => match self
+                        .store
+                        .retire_memory(bot_id, group_id, target, self.origin, now)
+                        .await
+                    {
+                        Ok(true) => Ok(ApplyOutcome::Retired(target.to_string())),
+                        // Retired between the read and the write.
+                        Ok(false) => Ok(ApplyOutcome::RejectedArchived(target.to_string())),
+                        Err(e) => Err(e),
+                    },
                 }
             }
         }
@@ -160,8 +236,10 @@ impl MemoryApplier {
             {
                 Ok(ApplyOutcome::Added(_)) => summary.added += 1,
                 Ok(ApplyOutcome::Updated(_)) => summary.updated += 1,
+                Ok(ApplyOutcome::Retired(_)) => summary.retired += 1,
                 Ok(ApplyOutcome::RejectedOutOfScope) => summary.out_of_scope += 1,
                 Ok(ApplyOutcome::RejectedArchived(_)) => summary.archived += 1,
+                Ok(ApplyOutcome::RejectedSealed) => summary.sealed += 1,
                 Err(_) => summary.failed += 1,
             }
         }
@@ -174,15 +252,24 @@ impl MemoryApplier {
 pub struct ApplySummary {
     pub added: usize,
     pub updated: usize,
+    pub retired: usize,
     pub out_of_scope: usize,
     /// Updates refused because the target row is retired.
     pub archived: usize,
+    /// Ops refused because their topic is sealed for the group ([seal-2]).
+    pub sealed: usize,
     pub failed: usize,
 }
 
 impl ApplySummary {
     pub fn total(&self) -> usize {
-        self.added + self.updated + self.out_of_scope + self.archived + self.failed
+        self.added
+            + self.updated
+            + self.retired
+            + self.out_of_scope
+            + self.archived
+            + self.sealed
+            + self.failed
     }
 }
 
@@ -199,6 +286,150 @@ mod tests {
         (dir, Arc::new(SqliteStore::new(pool)))
     }
 
+    fn seal_failure_op(content: &str) -> MemoryOp {
+        MemoryOp {
+            op: MemoryOpKind::Add,
+            subject_ref: None,
+            content: content.into(),
+            kind: "fact".into(),
+            source_refs: vec![],
+            confidence: 0.8,
+            memory_ref: None,
+            slot: None,
+            tags: vec![],
+            ttl: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn seal_read_failure_refuses_add_then_recovers_without_unsealing() {
+        let (_dir, store) = store().await;
+        store.ensure_group("bot", "100", 1).await.unwrap();
+        store
+            .add_sealed_topic("bot", "100", &["水泥".into()], "", "fixture", "operator", 2)
+            .await
+            .unwrap();
+        let applier = MemoryApplier::new(Arc::clone(&store));
+        sqlx::query("ALTER TABLE sealed_topics RENAME TO sealed_topics_fault_fixture")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let failed = applier
+            .apply(
+                "bot",
+                "100",
+                &seal_failure_op("水泥"),
+                |_| None,
+                |_| None,
+                3,
+            )
+            .await;
+        assert!(
+            failed.is_err(),
+            "sealed lookup failure silently allowed Add"
+        );
+        assert!(
+            store
+                .list_memories("bot", "100", 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        sqlx::query("ALTER TABLE sealed_topics_fault_fixture RENAME TO sealed_topics")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            applier
+                .apply(
+                    "bot",
+                    "100",
+                    &seal_failure_op("咖啡"),
+                    |_| None,
+                    |_| None,
+                    4
+                )
+                .await
+                .unwrap(),
+            ApplyOutcome::Added(_)
+        ));
+        assert_eq!(
+            applier
+                .apply(
+                    "bot",
+                    "100",
+                    &seal_failure_op("水泥"),
+                    |_| None,
+                    |_| None,
+                    5
+                )
+                .await
+                .unwrap(),
+            ApplyOutcome::RejectedSealed
+        );
+        assert_eq!(
+            store.list_memories("bot", "100", 100).await.unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn seal_read_failure_refuses_update_but_retirement_still_works() {
+        let (_dir, store) = store().await;
+        store.ensure_group("bot", "100", 1).await.unwrap();
+        let applier = MemoryApplier::new(Arc::clone(&store));
+        let ApplyOutcome::Added(id) = applier
+            .apply(
+                "bot",
+                "100",
+                &seal_failure_op("原始内容"),
+                |_| None,
+                |_| None,
+                2,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("fixture must add")
+        };
+        sqlx::query("ALTER TABLE sealed_topics RENAME TO sealed_topics_fault_fixture")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let mut update = seal_failure_op("replacement");
+        update.op = MemoryOpKind::Update;
+        update.memory_ref = Some(id.clone());
+        assert!(
+            applier
+                .apply("bot", "100", &update, |_| None, |_| None, 3)
+                .await
+                .is_err(),
+            "sealed lookup failure silently superseded the old row"
+        );
+        let old = store
+            .memory_by_ref("bot", "100", &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.content, "原始内容");
+        assert!(!old.is_archived());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM memories")
+                .fetch_one(store.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        update.op = MemoryOpKind::Retire;
+        assert_eq!(
+            applier
+                .apply("bot", "100", &update, |_| None, |_| None, 4)
+                .await
+                .unwrap(),
+            ApplyOutcome::Retired(id)
+        );
+    }
+
     #[tokio::test]
     async fn source_refs_are_stored_as_real_message_ids() {
         let (_d, store) = store().await;
@@ -211,6 +442,9 @@ mod tests {
             source_refs: vec!["m1".into(), "m2".into()],
             confidence: 0.8,
             memory_ref: None,
+            slot: None,
+            tags: Vec::new(),
+            ttl: None,
         };
         let applier = MemoryApplier::new(Arc::clone(&store));
         let resolve_source = |alias: &str| match alias {
@@ -235,6 +469,75 @@ mod tests {
         assert_eq!(row.source_message_ids, r#"["982004594","982004595"]"#);
     }
 
+    /// [seal-2] The applier is the store door: a caller that skipped
+    /// contract validation still cannot write a sealed topic — neither
+    /// as an add nor as an update's replacement text.
+    #[tokio::test]
+    async fn sealed_topic_is_refused_at_the_applier() {
+        let (_d, store) = store().await;
+        store.ensure_group("bot", "100", 1).await.expect("建组");
+        store
+            .add_sealed_topic(
+                "bot",
+                "100",
+                &["水泥".to_string()],
+                "",
+                "封存",
+                "operator",
+                5,
+            )
+            .await
+            .expect("封存");
+        let applier = MemoryApplier::new(Arc::clone(&store));
+        let op = |content: &str| MemoryOp {
+            op: MemoryOpKind::Add,
+            subject_ref: None,
+            content: content.into(),
+            kind: "fact".into(),
+            source_refs: vec!["m1".into()],
+            confidence: 0.8,
+            memory_ref: None,
+            slot: None,
+            tags: Vec::new(),
+            ttl: None,
+        };
+        let out = applier
+            .apply("bot", "100", &op("鱼缸被灌了水泥"), |_| None, |_| None, 20)
+            .await
+            .expect("apply");
+        assert_eq!(out, ApplyOutcome::RejectedSealed);
+        assert!(
+            store
+                .list_memories("bot", "100", 500)
+                .await
+                .expect("列出")
+                .is_empty(),
+            "封存话题不许落库"
+        );
+
+        let out = applier
+            .apply("bot", "100", &op("喜欢咖啡"), |_| None, |_| None, 21)
+            .await
+            .expect("apply");
+        let ApplyOutcome::Added(memory_ref) = out else {
+            panic!("正常内容应该新增");
+        };
+        let mut update = op("改成爱灌水泥");
+        update.op = MemoryOpKind::Update;
+        update.memory_ref = Some(memory_ref.clone());
+        let out = applier
+            .apply("bot", "100", &update, |_| None, |_| None, 22)
+            .await
+            .expect("apply");
+        assert_eq!(out, ApplyOutcome::RejectedSealed);
+        let row = store
+            .memory_by_ref("bot", "100", &memory_ref)
+            .await
+            .expect("查询")
+            .expect("存在");
+        assert_eq!(row.content, "喜欢咖啡", "被拒的 update 不许改动原行");
+    }
+
     #[tokio::test]
     async fn update_finds_the_store_key_that_retrieval_injected() {
         let (_d, store) = store().await;
@@ -253,6 +556,7 @@ mod tests {
             speaker_refs: &[],
             subject_aliases: &[],
             budget: DEFAULT_BUDGET,
+            now: 1_000_000,
         });
         assert_eq!(ctx.entries[0].memory_ref, memory_ref);
 
@@ -264,19 +568,37 @@ mod tests {
             source_refs: vec![],
             confidence: 0.9,
             memory_ref: Some(memory_ref.clone()),
+            slot: None,
+            tags: Vec::new(),
+            ttl: None,
         };
         let applier = MemoryApplier::new(Arc::clone(&store));
         let out = applier
             .apply("bot", "100", &op, |_| None, |_| None, 20)
             .await
             .expect("apply");
-        assert_eq!(out, ApplyOutcome::Updated(memory_ref.clone()));
-        let row = store
+        // Supersede semantics (memfix [mf-1]): the update lands as a successor
+        // row; the old row closes as `superseded` pointing at it.
+        let ApplyOutcome::Updated(new_ref) = out else {
+            panic!("应该顶替");
+        };
+        assert_ne!(new_ref, memory_ref);
+        let old = store
             .memory_by_ref("bot", "100", &memory_ref)
             .await
             .expect("查询")
             .expect("存在");
+        assert_eq!(old.state, "superseded");
+        assert_eq!(old.superseded_by.as_deref(), Some(new_ref.as_str()));
+        assert_eq!(old.content, "喜欢咖啡");
+        let row = store
+            .memory_by_ref("bot", "100", &new_ref)
+            .await
+            .expect("查询")
+            .expect("存在");
         assert_eq!(row.content, "改成喝茶");
+        assert_eq!(row.state, "active");
+        assert_eq!(row.revision, 2);
     }
 
     #[tokio::test]
@@ -306,27 +628,163 @@ mod tests {
             source_refs: vec![],
             confidence: 0.9,
             memory_ref: Some(memory_ref.clone()),
+            slot: None,
+            tags: Vec::new(),
+            ttl: None,
         };
         let applier = MemoryApplier::new(Arc::clone(&store));
         let out = applier
             .apply("bot", "100", &op, |_| None, |_| None, 20)
             .await
             .expect("apply");
-        assert_eq!(out, ApplyOutcome::Updated(memory_ref.clone()));
+        let ApplyOutcome::Updated(new_ref) = out else {
+            panic!("应该顶替");
+        };
         let row = store
-            .memory_by_ref("bot", "100", &memory_ref)
+            .memory_by_ref("bot", "100", &new_ref)
             .await
             .expect("查询")
             .expect("存在");
-        // The brain endorsed it: provenance follows the last writer, not the first.
+        // The brain endorsed it: the successor is written under the agent's
+        // provenance, not the extractor's.
         assert_eq!(row.origin, crate::store::origin::AGY);
         assert_eq!(row.content, "其实不喝咖啡，只喝红茶");
         let actor: String = sqlx::query_scalar(
-            "SELECT actor_kind FROM audit_events WHERE action = 'memory.update'",
+            "SELECT actor_kind FROM audit_events WHERE action = 'memory.supersede'",
         )
         .fetch_one(&store.pool)
         .await
         .expect("审计");
         assert_eq!(actor, crate::store::origin::AGY);
+    }
+    #[tokio::test]
+    async fn v1_fields_round_trip_and_merge_on_update() {
+        let (_d, store) = store().await;
+        store.ensure_group("bot", "100", 1).await.expect("建组");
+        let op = MemoryOp {
+            op: MemoryOpKind::Add,
+            subject_ref: None,
+            content: "只认可成品".into(),
+            kind: "preference".into(),
+            source_refs: vec!["m1".into()],
+            confidence: 0.8,
+            memory_ref: None,
+            slot: Some("高达模型取向".into()),
+            tags: vec!["高达".into()],
+            ttl: Some(crate::memory::schema::Ttl::Days30),
+        };
+        let applier = MemoryApplier::new(Arc::clone(&store));
+        let out = applier
+            .apply("bot", "100", &op, |_| None, |_| None, 1_000)
+            .await
+            .expect("apply");
+        let ApplyOutcome::Added(memory_ref) = out else {
+            panic!("应该新增");
+        };
+        let row = store
+            .memory_by_ref("bot", "100", &memory_ref)
+            .await
+            .expect("查询")
+            .expect("存在");
+        assert_eq!(row.slot, "高达模型取向");
+        assert_eq!(row.tags, vec!["高达".to_string()]);
+        assert_eq!(row.expires_at, Some(1_000 + 30 * 86_400));
+
+        // An update carrying only a new slot supersedes the row: the successor
+        // keeps the stored tags, and with no ttl in the op the old expiry is
+        // carried over exactly instead of rematerialising the kind default.
+        let op = MemoryOp {
+            op: MemoryOpKind::Update,
+            subject_ref: None,
+            content: "只认可成品和 MGSD".into(),
+            kind: "preference".into(),
+            source_refs: vec!["m1".into()],
+            confidence: 0.9,
+            memory_ref: Some(memory_ref.clone()),
+            slot: Some("高达模型取向（含MGSD）".into()),
+            tags: Vec::new(),
+            ttl: None,
+        };
+        let out = applier
+            .apply("bot", "100", &op, |_| None, |_| None, 2_000)
+            .await
+            .expect("apply");
+        let ApplyOutcome::Updated(new_ref) = out else {
+            panic!("应该顶替");
+        };
+        let row = store
+            .memory_by_ref("bot", "100", &new_ref)
+            .await
+            .expect("查询")
+            .expect("存在");
+        assert_eq!(row.slot, "高达模型取向（含MGSD）");
+        assert_eq!(row.tags, vec!["高达".to_string()]);
+        assert_eq!(row.expires_at, Some(1_000 + 30 * 86_400));
+    }
+
+    #[tokio::test]
+    async fn retire_closes_the_row_and_rejects_further_writes() {
+        let (_d, store) = store().await;
+        store.ensure_group("bot", "100", 1).await.expect("建组");
+        let memory_ref = store
+            .insert_memory("bot", "100", None, "欠十遍检讨", "fact", "[]", 0.8, 10)
+            .await
+            .expect("写入");
+        let applier = MemoryApplier::new(Arc::clone(&store));
+        let retire = MemoryOp {
+            op: MemoryOpKind::Retire,
+            subject_ref: None,
+            content: "管理员已免除".into(),
+            kind: "fact".into(),
+            source_refs: vec![],
+            confidence: 0.9,
+            memory_ref: Some(memory_ref.clone()),
+            slot: None,
+            tags: Vec::new(),
+            ttl: None,
+        };
+        let out = applier
+            .apply("bot", "100", &retire, |_| None, |_| None, 20)
+            .await
+            .expect("apply");
+        assert_eq!(out, ApplyOutcome::Retired(memory_ref.clone()));
+        let row = store
+            .memory_by_ref("bot", "100", &memory_ref)
+            .await
+            .expect("查询")
+            .expect("存在");
+        assert_eq!(row.state, "retired");
+        assert!(row.is_archived());
+        // Gone from the active read path.
+        assert!(
+            store
+                .list_memories("bot", "100", 500)
+                .await
+                .expect("列出")
+                .is_empty()
+        );
+        // A retired row refuses a second retire and an update alike.
+        let out = applier
+            .apply("bot", "100", &retire, |_| None, |_| None, 30)
+            .await
+            .expect("apply");
+        assert_eq!(out, ApplyOutcome::RejectedArchived(memory_ref.clone()));
+        let update = MemoryOp {
+            op: MemoryOpKind::Update,
+            subject_ref: None,
+            content: "其实还欠".into(),
+            kind: "fact".into(),
+            source_refs: vec![],
+            confidence: 0.9,
+            memory_ref: Some(memory_ref.clone()),
+            slot: None,
+            tags: Vec::new(),
+            ttl: None,
+        };
+        let out = applier
+            .apply("bot", "100", &update, |_| None, |_| None, 40)
+            .await
+            .expect("apply");
+        assert_eq!(out, ApplyOutcome::RejectedArchived(memory_ref.clone()));
     }
 }

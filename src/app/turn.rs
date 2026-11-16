@@ -92,6 +92,8 @@ pub struct TurnExecutor {
     pub hourly_call_budget: u32,
     /// Where sticker bytes are written. Empty in tests that never touch the library.
     pub sticker_dir: std::path::PathBuf,
+    /// Where generated pictures wait for delivery (imagegen output directory).
+    pub imagegen_dir: std::path::PathBuf,
     /// Long-lived root for per-group Agy project directories.
     ///
     /// Each group gets `<agy_projects_dir>/<group_id>` holding its `AGENTS.md`. Agy reads
@@ -349,21 +351,6 @@ pub struct TurnTiming {
     pub agent_started: std::time::Instant,
 }
 
-pub trait FreshnessCoverage: Send + Sync {
-    /// The newest message timestamp among everything this turn speaks for.
-    fn newest(&self, messages: &[IncomingMessage]) -> Option<i64>;
-
-    /// The oldest batch that arrived after `newest` and was never delivered,
-    /// as `(batch_id, newest_received_at)`. `None` means nothing is uncovered.
-    fn uncovered(&self, newest: i64) -> Option<(String, i64)>;
-
-    /// Every pending row this turn consumes on success.
-    fn event_ids(&self, job: &BatchJob) -> Vec<i64>;
-
-    /// Audit tag naming the coverage kind in a drop's action.
-    fn label(&self) -> &'static str;
-}
-
 /// One batch delivered into a resident turn: what it covered and when it arrived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResidentDelivery {
@@ -385,6 +372,28 @@ pub struct ResidentCoverage {
 }
 
 impl ResidentCoverage {
+    /// The newest message timestamp among everything this turn speaks for.
+    ///
+    /// The union: the reply speaks for every delivered batch, so its age is the
+    /// newest of all of them, not just the first one's messages.
+    pub fn newest(&self, messages: &[IncomingMessage]) -> Option<i64> {
+        self.batches
+            .iter()
+            .map(|b| b.newest)
+            .max()
+            .or_else(|| messages.iter().map(|m| m.received_at).max())
+    }
+
+    /// The oldest batch that arrived after `newest` and was never delivered, as
+    /// `(batch_id, newest_received_at)`. `None` means nothing is uncovered.
+    pub fn uncovered(&self, newest: i64) -> Option<(String, i64)> {
+        self.batches
+            .iter()
+            .filter(|b| b.newest > newest)
+            .min_by_key(|b| b.newest)
+            .map(|b| (b.batch_id.clone(), b.newest))
+    }
+
     /// Every event id the turn consumed, deduplicated, for the single
     /// `delete_pending` that follows a successful send.
     pub fn event_ids(&self) -> Vec<i64> {
@@ -410,37 +419,6 @@ impl ResidentCoverage {
     /// was already answering.
     pub fn any_privileged(&self) -> bool {
         self.batches.iter().any(|b| b.privileged)
-    }
-}
-
-impl FreshnessCoverage for ResidentCoverage {
-    fn newest(&self, messages: &[IncomingMessage]) -> Option<i64> {
-        // The union: the reply speaks for every delivered batch, so its age is
-        // the newest of all of them, not just the first one's messages.
-        self.batches
-            .iter()
-            .map(|b| b.newest)
-            .max()
-            .or_else(|| messages.iter().map(|m| m.received_at).max())
-    }
-
-    fn uncovered(&self, newest: i64) -> Option<(String, i64)> {
-        self.batches
-            .iter()
-            .filter(|b| b.newest > newest)
-            .min_by_key(|b| b.newest)
-            .map(|b| (b.batch_id.clone(), b.newest))
-    }
-
-    fn event_ids(&self, job: &BatchJob) -> Vec<i64> {
-        if self.batches.is_empty() {
-            return job.event_ids.clone();
-        }
-        self.event_ids()
-    }
-
-    fn label(&self) -> &'static str {
-        "resident"
     }
 }
 
@@ -630,6 +608,8 @@ pub fn build_prompt_batch(
         memory_refs: memory_context.memory_refs(),
         history_refs: Vec::new(),
         sticker_hashes: images.sticker_hashes.clone(),
+        // Filled in by the caller, which owns store access ([seal-2]).
+        sealed_topics: Vec::new(),
     };
     let anchor_items: Vec<AnchorItem> = messages
         .iter()
@@ -669,6 +649,7 @@ pub fn build_prompt_batch(
         annex: None,
         flooded: false,
         flood_background: None,
+        spontaneous: None,
         turn_token: None,
         now_line: None,
     };
@@ -899,9 +880,9 @@ fn apply_image_tags(
 /// running batch's validation scope, and a colliding ref would let the model
 /// quote a message this insert never showed it. Newlines collapse so one
 /// message stays one line.
-fn render_insert_lines(messages: &[IncomingMessage]) -> String {
+fn render_insert_lines(messages: &[IncomingMessage], first_ref: usize) -> String {
     let mut out = String::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         let text = message
             .text
             .split_whitespace()
@@ -914,10 +895,11 @@ fn render_insert_lines(messages: &[IncomingMessage]) -> String {
             let name = message.display_name.trim();
             if name.is_empty() { "群友" } else { name }
         };
+        let reference = format!("m{} {}", first_ref + index, message.speaker_ref);
         if message.mentions_bot {
-            out.push_str(&format!("- {who}：{text}（点了你）\n"));
+            out.push_str(&format!("- {reference} {who}：{text}（点了你）\n"));
         } else {
-            out.push_str(&format!("- {who}：{text}\n"));
+            out.push_str(&format!("- {reference} {who}：{text}\n"));
         }
     }
     out
@@ -1063,11 +1045,11 @@ mod sessions;
 
 pub mod history;
 
-pub use self::history::seed_brief_for;
+pub use self::history::{PreviousBatch, seed_brief_for};
 
 use self::history::{
-    ANNEX_LINE_CHARS, ANNEX_REF_PREFIX, HistoryTarget, PreviousBatch, SEED_FACT_LIMIT,
-    SEED_LINE_CHARS, SEED_MAX_CHARS, SEED_WINDOW_MESSAGES, assemble_annex, assemble_seed_brief,
+    ANNEX_LINE_CHARS, ANNEX_REF_PREFIX, HistoryTarget, SEED_FACT_LIMIT, SEED_LINE_CHARS,
+    SEED_MAX_CHARS, SEED_WINDOW_MESSAGES, assemble_annex, assemble_seed_brief,
 };
 
 pub mod gates;
@@ -1084,9 +1066,9 @@ use self::gates::{
 pub mod stickers;
 
 use self::stickers::{
-    EMOTION_TRIGGERS, MAX_OFFER_QUERIES, MAX_STICKER_OFFERS, OFFER_SCAN_LIMIT, RECENT_ROUND_LIMIT,
-    RECENT_SEND_SCAN_LIMIT, emotion_bucket, first_label, habit_pick, pick_diverse, quote_summary,
-    rounds_just_sent, trigger_queries,
+    EMOTION_TRIGGERS, MAX_OFFER_QUERIES, MAX_STICKER_OFFERS, OFFER_COOLDOWN_SENDS,
+    OFFER_SCAN_LIMIT, RECENT_SEND_SCAN_LIMIT, emotion_bucket, first_label, pick_diverse,
+    quote_summary, rank_offer_candidates, trigger_queries,
 };
 
 #[cfg(test)]

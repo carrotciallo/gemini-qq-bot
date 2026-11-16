@@ -131,6 +131,31 @@ fn slice<'a>(events: &'a [StepEvent], spec: &TurnSpec) -> Vec<&'a StepEvent> {
         .collect()
 }
 
+/// 一轮的步数口径。
+///
+/// 常驻会话里一条 agent call 会跨很多轮，所以「步流里一共多少事件」和「这一轮新
+/// 增了多少步」不是同一个数。前者是会话的累计量，后者才是本轮的规模。混用会让
+/// 审计把累计当成本轮计费（K2）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepCounts {
+    /// 整条步流的事件数 —— 会话累计量。
+    pub session_events: i64,
+    /// 轮片内的事件数 —— 本轮增量，`start_idx..end_idx` 之间。
+    pub turn_delta: i64,
+    /// 最后一条事件的 idx；空流时为 0。这是「最后有效进展」的落点，和
+    /// `last_progress` 的时间戳是同一件事的两个面。
+    pub last_progress_idx: i64,
+}
+
+/// 用同一条步流和同一个 `TurnSpec` 算出三个口径。
+pub fn step_counts(events: &[StepEvent], spec: &TurnSpec) -> StepCounts {
+    StepCounts {
+        session_events: events.len() as i64,
+        turn_delta: slice(events, spec).len() as i64,
+        last_progress_idx: events.iter().map(|e| e.idx).max().unwrap_or(0),
+    }
+}
+
 /// 本轮所有被草稿规则标记为「永不交付」的 agent_text（最后一个被接纳 user 步之前）。
 pub fn list_drafts(events: &[StepEvent], spec: &TurnSpec) -> Vec<i64> {
     let sl = slice(events, spec);
@@ -714,6 +739,42 @@ mod tests {
         assert_eq!(list_drafts(&events, &spec), vec![1, 3]);
         let drafts = list_drafts(&events, &spec);
         assert!(!drafts.contains(&verdict.deliver_idx().expect("idx")));
+    }
+
+    // ---- 步数口径：会话累计 vs 本轮增量 ----
+
+    /// 一条常驻会话跨多轮时，`session_events` 是整条流的量，`turn_delta` 只数本轮
+    /// 片区。两者混用会把上一轮的历史算进本轮规模（K2 的计量口径问题）。
+    #[test]
+    fn turn_delta_counts_only_this_round_while_session_events_counts_the_stream() {
+        let events = vec![
+            user(0, "上一轮的问题", 100.0),
+            ev(1, "agent_text", "上一轮的回答", 101.0),
+            user(2, "这一轮的问题", 200.0),
+            ev(3, "tool_call", "search", 201.0),
+            ev(4, "agent_text", "这一轮的回答", 202.0),
+        ];
+        // 本轮从 idx 2 开始，还没有结束标记：至今可见 3 条。
+        let spec = TurnSpec::new(2);
+        let counts = step_counts(&events, &spec);
+        assert_eq!(counts.session_events, 5, "整条步流");
+        assert_eq!(counts.turn_delta, 3, "只数本轮的 2/3/4");
+        assert_eq!(counts.last_progress_idx, 4);
+        assert_ne!(counts.session_events, counts.turn_delta);
+    }
+
+    /// `end_idx` 被设置后增量按半开区间收口，不会把结束标记之后的事件也算进来。
+    #[test]
+    fn turn_delta_stops_at_the_end_marker() {
+        let events = vec![
+            user(2, "问题", 200.0),
+            ev(3, "agent_text", "回答", 201.0),
+            ev(9, "agent_text", "下一轮才出现", 300.0),
+        ];
+        let counts = step_counts(&events, &TurnSpec::new(2).with_end(Some(4)));
+        assert_eq!(counts.session_events, 3, "流里一共三条");
+        assert_eq!(counts.turn_delta, 2, "idx 9 不属于这一轮");
+        assert_eq!(counts.last_progress_idx, 9, "最后进展仍取全流最大 idx");
     }
 
     #[test]

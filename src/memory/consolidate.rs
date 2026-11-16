@@ -156,6 +156,9 @@ pub struct MergedProposal {
     pub content: String,
     /// The `memory_ref` keys this merge claims to replace.
     pub archive: Vec<String>,
+    /// Schema v1 slot for the merged row, when the model named one. Empty means
+    /// the server inherits the cluster's own slot.
+    pub slot: String,
 }
 
 /// Read the `merges` array out of a consolidation reply.
@@ -200,11 +203,18 @@ pub fn parse_merges(raw: &str) -> Option<Vec<MergedProposal>> {
                     .collect::<Vec<String>>()
             })
             .unwrap_or_default();
+        let slot = item
+            .get("slot")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         out.push(MergedProposal {
             subject,
             kind,
             content,
             archive,
+            slot,
         });
     }
     Some(out)
@@ -226,17 +236,23 @@ pub fn render_prompt(clusters: &[(String, Vec<&MemoryRecord>)]) -> String {
 （时间、偏好、称呼、约定），删掉重复与已被推翻的旧说法。\n\
 - `kind` 从 fact / preference / topic / relation / event 里选一个最贴合的。\n\
 - `archive` 列出被这次合并取代的条目键，只能是本组里出现过的键，至少 2 个。\n\
+- 合并后的 content 只能写本组这个人的事：组里条目若混进了别人的事（群里的玩笑、互怼常把归属说错），不要把别人的事并进这个人的条目，宁可不合并这一组。\n\
 - 不要输出群号、QQ 号、消息 id、CQ 码，正文里也不要出现条目键。\n\
 - 没有值得合并的组就不输出它；全部都不值得合并就输出空数组。\n\n\
 只输出这一个 JSON 对象，不要任何解释或代码块以外的文字：\n\
-{\"merges\":[{\"subject\":\"u1\",\"kind\":\"preference\",\"content\":\"……\",\"archive\":[\"mem_xxx\",\"mem_yyy\"]}]}\n\n",
+{\"merges\":[{\"subject\":\"u1\",\"kind\":\"preference\",\"slot\":\"短标签（可省略，省略时沿用本组槽位）\",\"content\":\"……\",\"archive\":[\"mem_xxx\",\"mem_yyy\"]}]}\n\n",
     );
     for (label, rows) in clusters {
         out.push_str(&format!("# 分组 {label}（{} 条）\n", rows.len()));
         for row in rows {
+            let slot = if row.slot.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", row.slot)
+            };
             out.push_str(&format!(
-                "- {} ({}, c{:.2}) {}\n",
-                row.memory_ref, row.kind, row.confidence, row.content
+                "- {} ({}, c{:.2}){}{}\n",
+                row.memory_ref, row.kind, row.confidence, slot, row.content
             ));
         }
         out.push('\n');
@@ -244,25 +260,50 @@ pub fn render_prompt(clusters: &[(String, Vec<&MemoryRecord>)]) -> String {
     out
 }
 
-/// Cluster active rows by subject.
+/// One consolidation cluster's identity (schema v1): who the rows are about,
+/// what kind they are, and which slot they claim. Rows whose slot is empty share
+/// the `(subject, kind)` bucket, so pre-v1 rows still cluster exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterKey {
+    /// Normalised subject id, or empty for group-level rows.
+    pub subject_key: String,
+    pub kind: String,
+    /// The v1 predicate label; empty is its own bucket.
+    pub slot: String,
+}
+
+/// Cluster active rows by (subject, kind, slot).
 ///
 /// Only clusters with at least [`MIN_CLUSTER_SIZE`] rows are returned — a singleton has
 /// nothing to merge. Clusters are ordered largest first, then by most recent activity,
 /// and the total number of rows handed to the model is capped at
 /// [`MAX_CONSOLIDATE_ENTRIES`].
-pub fn cluster(rows: &[MemoryRecord]) -> Vec<(String, Vec<&MemoryRecord>)> {
-    let mut grouped: BTreeMap<String, Vec<&MemoryRecord>> = BTreeMap::new();
+pub fn cluster(rows: &[MemoryRecord]) -> Vec<(ClusterKey, Vec<&MemoryRecord>)> {
+    let mut grouped: BTreeMap<(String, String, String), Vec<&MemoryRecord>> = BTreeMap::new();
     for row in rows.iter().filter(|row| !row.is_archived()) {
-        let key = row
+        let subject_key = row
             .subject_user_id
             .as_deref()
             .map(normalize_subject)
             .unwrap_or_default();
-        grouped.entry(key).or_default().push(row);
+        grouped
+            .entry((subject_key, row.kind.clone(), row.slot.clone()))
+            .or_default()
+            .push(row);
     }
-    let mut clusters: Vec<(String, Vec<&MemoryRecord>)> = grouped
+    let mut clusters: Vec<(ClusterKey, Vec<&MemoryRecord>)> = grouped
         .into_iter()
         .filter(|(_, rows)| rows.len() >= MIN_CLUSTER_SIZE)
+        .map(|((subject_key, kind, slot), rows)| {
+            (
+                ClusterKey {
+                    subject_key,
+                    kind,
+                    slot,
+                },
+                rows,
+            )
+        })
         .collect();
     clusters.sort_by(|a, b| {
         let a_recent = a.1.iter().map(|r| r.updated_at).max().unwrap_or(0);
@@ -280,6 +321,25 @@ pub fn cluster(rows: &[MemoryRecord]) -> Vec<(String, Vec<&MemoryRecord>)> {
         kept.push((key, rows.into_iter().take(take).collect()));
     }
     kept
+}
+
+/// True when every row is about the same subject (two group-level rows
+/// count as the same subject). The merge partition invariant of [opt-4]:
+/// a merge unit must never fold two people's rows into one.
+fn same_subject(rows: &[&MemoryRecord]) -> bool {
+    let key = |row: &MemoryRecord| {
+        row.subject_user_id
+            .as_deref()
+            .map(normalize_subject)
+            .unwrap_or_default()
+    };
+    match rows.first() {
+        None => true,
+        Some(first) => {
+            let first_key = key(first);
+            rows.iter().all(|row| key(row) == first_key)
+        }
+    }
 }
 
 /// Display label for a cluster key: the group-local alias when one is known.
@@ -427,6 +487,14 @@ impl Consolidator {
             Ok(rows) => rows,
             Err(_) => return ConsolidationReport::failed("store"),
         };
+        // Sealed topics ([seal-2]): merges must not re-materialise a dead
+        // topic as a fresh consolidated row. Read once per pass; a failed
+        // read fails open, as at the other enforcement points.
+        let sealed = self
+            .store
+            .list_sealed_topics(bot_id, group_id)
+            .await
+            .unwrap_or_default();
         // Paraphrases and runtime bookkeeping are archived before the model
         // threshold. A group of 31 rows never reached that call, so the same
         // claim sat in the store three times.
@@ -449,7 +517,22 @@ impl Consolidator {
         }
         let labelled: Vec<(String, Vec<&MemoryRecord>)> = clusters
             .iter()
-            .map(|(key, rows)| (cluster_label(key, aliases), rows.clone()))
+            .map(|(key, rows)| {
+                let slot = if key.slot.is_empty() {
+                    "无槽位"
+                } else {
+                    key.slot.as_str()
+                };
+                (
+                    format!(
+                        "{} · {} · {}",
+                        cluster_label(&key.subject_key, aliases),
+                        key.kind,
+                        slot
+                    ),
+                    rows.clone(),
+                )
+            })
             .collect();
         let prompt = render_prompt(&labelled);
 
@@ -473,6 +556,7 @@ impl Consolidator {
                     group_id,
                     &clusters,
                     proposal,
+                    &sealed,
                     &task_id,
                     now,
                     &mut report,
@@ -492,19 +576,23 @@ impl Consolidator {
     /// Refusal is all-or-nothing: the replacement row and the retirements go together,
     /// so a unit can never archive a row and then fail to keep its content.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn apply_merge(
         &self,
         bot_id: &str,
         group_id: &str,
-        clusters: &[(String, Vec<&MemoryRecord>)],
+        clusters: &[(ClusterKey, Vec<&MemoryRecord>)],
         proposal: &MergedProposal,
+        sealed: &[crate::store::SealedTopic],
         task_id: &str,
         now: i64,
         report: &mut ConsolidationReport,
     ) -> Option<()> {
         let cluster = clusters
             .iter()
-            .find(|(label, _)| normalize_subject(label) == normalize_subject(&proposal.subject))
+            .find(|(key, _)| {
+                normalize_subject(&key.subject_key) == normalize_subject(&proposal.subject)
+            })
             .or_else(|| {
                 // A cluster label may be "群成员" for an alias we could not resolve; fall
                 // back to locating the cluster that owns every cited key.
@@ -544,6 +632,25 @@ impl Consolidator {
             report.rejected += 1;
             return None;
         }
+        // Hard partition invariant ([opt-4]): a merge unit folds rows of
+        // exactly one subject. Clusters are built that way and the key
+        // containment check above already implies it, but the invariant
+        // is enforced here, at the point of harm, so a future change to
+        // clustering cannot silently sew two people's facts into one row
+        // (the 2026-11-12 audit found exactly such a sewn row in
+        // production memory).
+        if !same_subject(&replaced) {
+            report.rejected += 1;
+            return None;
+        }
+        // Sealed topics ([seal-2]): the merged row would carry the dead
+        // topic back into the active set under a fresh ref — exactly how
+        // the 112 cement saga kept consolidating itself into longer and
+        // longer canonical rows. Refuse the unit whole.
+        if crate::memory::sealed::hit(sealed, &cluster.0.slot, &proposal.content).is_some() {
+            report.rejected += 1;
+            return None;
+        }
         // Protection is checked per unit, not per row: retiring half a cluster while
         // leaving the protected half active would keep both the new row and the fact it
         // is supposed to replace.
@@ -566,9 +673,36 @@ impl Consolidator {
         let source_ids = serde_json::to_string(&ids.into_iter().collect::<Vec<i64>>())
             .unwrap_or_else(|_| "[]".into());
 
+        // The merged row inherits the cluster's v1 shape: the model's slot when
+        // it named one, else the first replaced row's; tags are the union; the
+        // expiry is the cluster's own — permanent if any source is permanent,
+        // otherwise the latest — never a fresh clock.
+        let inherited_slot = replaced
+            .iter()
+            .map(|row| row.slot.clone())
+            .find(|slot| !slot.is_empty())
+            .unwrap_or_default();
+        let raw_slot = if proposal.slot.trim().is_empty() {
+            inherited_slot
+        } else {
+            proposal.slot.clone()
+        };
+        let raw_tags: Vec<String> = replaced.iter().flat_map(|row| row.tags.clone()).collect();
+        let (slot, tags) = crate::memory::schema::sanitize_slot_tags(&raw_slot, &raw_tags);
+        let expires_override = if replaced.iter().any(|row| row.expires_at.is_none()) {
+            Some(None)
+        } else {
+            Some(replaced.iter().filter_map(|row| row.expires_at).max())
+        };
+        let v1 = crate::memory::schema::MemoryV1Fields {
+            slot,
+            tags,
+            ttl: None,
+            expires_override,
+        };
         let created = self
             .store
-            .insert_memory_with_origin(
+            .insert_memory_v1(
                 bot_id,
                 group_id,
                 replaced
@@ -579,6 +713,7 @@ impl Consolidator {
                 &source_ids,
                 confidence,
                 origin::HY3,
+                &v1,
                 now,
             )
             .await;
@@ -633,6 +768,12 @@ mod tests {
             archived_at: None,
             created_at: at,
             updated_at: at,
+            slot: String::new(),
+            tags: Vec::new(),
+            expires_at: None,
+            state: "active".to_string(),
+            superseded_by: None,
+            state_changed_at: None,
         }
     }
 
@@ -721,6 +862,59 @@ mod tests {
         )
     }
 
+    /// [seal-2] A merge whose result is about a sealed topic is refused
+    /// whole: no canonical row is created and the sources stay active.
+    /// This is the exact shape of the 112 cement saga, whose rows kept
+    /// consolidating into longer and longer canonical versions.
+    #[tokio::test]
+    async fn a_merge_about_a_sealed_topic_is_refused() {
+        let mut rows = filler();
+        rows.push(m(Some("7"), "鱼缸被灌了水泥", origin_static_hy3(), 100));
+        rows.push(m(Some("7"), "水泥干透成实心摆件", origin_static_hy3(), 200));
+        let (_dir, store) = seeded_store(&rows).await;
+        store
+            .add_sealed_topic(
+                "bot",
+                "100",
+                &["水泥".to_string()],
+                "",
+                "封存",
+                "operator",
+                500,
+            )
+            .await
+            .expect("封存");
+        let before = store.list_memories("bot", "100", 500).await.expect("读");
+        let keys: Vec<String> = before
+            .iter()
+            .filter(|r| r.subject_user_id.as_deref() == Some("7"))
+            .map(|r| r.memory_ref.clone())
+            .collect();
+        assert_eq!(keys.len(), 2);
+        let reply = serde_json::json!({
+            "merges": [{
+                "subject": "u1",
+                "kind": "fact",
+                "content": "他的鱼缸被水泥灌满并干透。",
+                "archive": [keys[0], keys[1]],
+            }]
+        })
+        .to_string();
+        let consolidator = Consolidator::new(Arc::clone(&store));
+        let aliases = vec![("u1".to_string(), "7".to_string())];
+        let report = consolidator
+            .run_once("bot", "100", &ok(&reply), &aliases, 1_000)
+            .await;
+        assert_eq!(report.created, 0);
+        assert!(report.rejected >= 1, "{report:?}");
+        let active = store.list_memories("bot", "100", 500).await.expect("读");
+        assert!(
+            keys.iter()
+                .all(|k| active.iter().any(|r| &r.memory_ref == k)),
+            "被拒的合并单元不许动源行"
+        );
+    }
+
     #[tokio::test]
     async fn a_merge_creates_the_canonical_row_and_archives_its_sources() {
         let mut rows = filler();
@@ -773,6 +967,97 @@ mod tests {
             audits.iter().any(|a| a.starts_with("memory.archive.task")),
             "缺归档审计"
         );
+    }
+
+    #[test]
+    fn clusters_split_by_slot_and_share_the_empty_slot_bucket() {
+        let mut a = row(1, Some("u1"), "a", 0.5, origin::HY3, 10);
+        a.slot = "咖啡".into();
+        let mut b = row(2, Some("u1"), "b", 0.5, origin::HY3, 20);
+        b.slot = "咖啡".into();
+        let mut c = row(3, Some("u1"), "c", 0.5, origin::HY3, 30);
+        c.slot = "茶叶".into();
+        let mut d = row(4, Some("u1"), "d", 0.5, origin::HY3, 40);
+        d.slot = "茶叶".into();
+        let e = row(5, Some("u1"), "e", 0.5, origin::HY3, 50);
+        let f = row(6, Some("u1"), "f", 0.5, origin::HY3, 60);
+        let rows = [a, b, c, d, e, f];
+        let clusters = cluster(&rows);
+        assert_eq!(clusters.len(), 3);
+        assert!(
+            clusters
+                .iter()
+                .any(|(k, r)| k.slot == "咖啡" && r.len() == 2)
+        );
+        assert!(
+            clusters
+                .iter()
+                .any(|(k, r)| k.slot.is_empty() && r.len() == 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_inherits_slot_tags_union_and_the_latest_expiry() {
+        let (_dir, store) = seeded_store(&filler()).await;
+        let fields =
+            |slot: &str, tags: &[&str], expires: i64| crate::memory::schema::MemoryV1Fields {
+                slot: slot.into(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                ttl: None,
+                expires_override: Some(Some(expires)),
+            };
+        let r1 = store
+            .insert_memory_v1(
+                "bot",
+                "100",
+                Some("7"),
+                "爱喝手冲咖啡",
+                "preference",
+                "[1]",
+                0.7,
+                origin::HY3,
+                &fields("咖啡", &["手冲"], 5_000),
+                100,
+            )
+            .await
+            .expect("写一");
+        let r2 = store
+            .insert_memory_v1(
+                "bot",
+                "100",
+                Some("7"),
+                "只喝美式不加糖",
+                "preference",
+                "[2]",
+                0.6,
+                origin::HY3,
+                &fields("咖啡", &["美式"], 9_000),
+                100,
+            )
+            .await
+            .expect("写二");
+        let reply = serde_json::json!({
+            "merges": [{
+                "subject": "u1", "kind": "preference",
+                "content": "他爱咖啡，手冲和美式都喝。",
+                "archive": [r1, r2],
+            }]
+        })
+        .to_string();
+        let consolidator = Consolidator::new(Arc::clone(&store));
+        let aliases = vec![("u1".to_string(), "7".to_string())];
+        let report = consolidator
+            .run_once("bot", "100", &ok(&reply), &aliases, 1_000)
+            .await;
+        assert_eq!(report.created, 1, "{report:?}");
+        let active = store.list_memories("bot", "100", 500).await.expect("读");
+        let merged = active
+            .iter()
+            .find(|r| r.content.contains("手冲和美式"))
+            .expect("规范条目应在");
+        assert_eq!(merged.slot, "咖啡");
+        assert_eq!(merged.tags, vec!["手冲".to_string(), "美式".to_string()]);
+        assert_eq!(merged.expires_at, Some(9_000), "取簇内最晚到期，不重启时钟");
     }
 
     #[tokio::test]
@@ -913,9 +1198,12 @@ mod tests {
         ];
         let clusters = cluster(&rows);
         assert_eq!(clusters.len(), 2);
-        assert_eq!(clusters[0].0, "", "group-level cluster is the largest");
+        assert_eq!(
+            clusters[0].0.subject_key, "",
+            "group-level cluster is the largest"
+        );
         assert_eq!(clusters[0].1.len(), 3);
-        assert_eq!(clusters[1].0, "u1");
+        assert_eq!(clusters[1].0.subject_key, "u1");
     }
 
     #[test]
@@ -977,6 +1265,29 @@ mod tests {
         assert!(prompt.contains("mem_1"));
         assert!(prompt.contains("# 分组 u1（2 条）"));
         assert!(prompt.contains("\"merges\""));
+        // [opt-4] The merge prompt must forbid sewing another person's
+        // facts into this cluster's row.
+        assert!(
+            prompt.contains("不要把别人的事并进这个人的条目"),
+            "{prompt}"
+        );
+    }
+
+    /// [opt-4] The partition invariant the merge applier enforces: rows
+    /// of two different people never count as one mergeable subject,
+    /// while two group-level rows do.
+    #[test]
+    fn same_subject_only_within_one_person() {
+        let a = row(1, Some("u1"), "甲", 0.5, origin::HY3, 10);
+        let b = row(2, Some("u1"), "乙", 0.5, origin::HY3, 20);
+        let c = row(3, Some("u2"), "丙", 0.5, origin::HY3, 30);
+        let g1 = row(4, None, "群事一", 0.5, origin::HY3, 40);
+        let g2 = row(5, None, "群事二", 0.5, origin::HY3, 50);
+        assert!(same_subject(&[&a, &b]));
+        assert!(!same_subject(&[&a, &c]));
+        assert!(!same_subject(&[&a, &g1]));
+        assert!(same_subject(&[&g1, &g2]));
+        assert!(same_subject(&[]));
     }
 
     #[test]

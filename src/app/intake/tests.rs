@@ -1640,7 +1640,14 @@ async fn an_ordinary_multi_person_chat_is_never_damped() {
                 .await;
         }
     }
-    let arrived = store.pending_for_group(BOT, "500").await.expect("读")[0].received_at;
+    let arrived = store
+        .pending_for_group(BOT, "500")
+        .await
+        .expect("读")
+        .iter()
+        .map(|row| row.received_at)
+        .max()
+        .unwrap();
     let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
     assert_eq!(jobs.len(), 1, "jobs: {jobs:?}");
     assert_eq!(jobs[0].event_ids.len(), 6);
@@ -1923,4 +1930,156 @@ async fn group_decrease_of_the_bot_marks_departed_and_rejoin_clears_it() {
         .expect("读组")
         .expect("有组");
     assert!(group.departed_at.is_none(), "重新入群应清 departed 标记");
+}
+
+/// A group the bot has been removed from keeps nothing per-group in memory:
+/// the resident ladder, probe window, canary day, replay mark and rejection
+/// count all describe a conversation that no longer exists, and the intake's
+/// own pacing caches are keyed by group id.
+#[tokio::test]
+async fn departure_forgets_every_per_group_cache() {
+    let (intake, store, _dir) = intake().await;
+    let resident = Arc::new(crate::app::resident::ResidentManager::new(
+        Arc::clone(&store),
+        BOT.to_string(),
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        String::new(),
+    ));
+    let turnover = Arc::new(crate::app::turn::RunningTurns::new());
+    let annex = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let intake = intake
+        .with_resident(Arc::clone(&resident))
+        .with_running_turns(Arc::clone(&turnover))
+        .with_previous_batch(Arc::clone(&annex));
+
+    // Populate one row in every table a live group touches.
+    intake.handle(&group_event("500", "7", "1", "hi")).await;
+    intake.record_cadence("500", "wait.quiet", 100).await;
+    intake.record_damper_wait("500", "quiet", 100).await;
+    resident.arm_retry("500", vec![1]).await;
+    resident.note_respawn_failure("500", 100).await;
+    // The first overlapping refusal only arms the strike; it is still a row.
+    assert!(!resident.note_prompt_rejection("500", &[1]).await);
+    residency_probe_and_canary(&resident).await;
+    turnover.register("500", 100);
+    annex.lock().await.insert(
+        "500".to_string(),
+        crate::app::turn::history::PreviousBatch {
+            conversation_id: "conv-500".to_string(),
+            table: "- [p1] 老王：hi".to_string(),
+            targets: Vec::new(),
+            next_ref: 2,
+            own_reply: None,
+        },
+    );
+    assert!(
+        intake.transient_group_rows() > 0,
+        "工况本身要有 intake 缓存"
+    );
+    assert!(
+        resident.transient_group_rows().await > 0,
+        "工况本身要有 resident 缓存"
+    );
+
+    let _ = intake
+        .handle(&serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": "kick_me",
+            "group_id": "500",
+            "user_id": BOT,
+            "self_id": BOT,
+            "time": 1_700_000_001,
+        }))
+        .await;
+
+    let intake_left = intake.transient_group_rows();
+    let resident_left = resident.transient_group_rows().await;
+    assert!(
+        intake_left == 0 && resident_left == 0,
+        "退群必须清空两侧缓存：intake 剩 {intake_left} 条，resident 剩 {resident_left} 条"
+    );
+    assert!(resident.retry_mark("500").await.is_none());
+    assert!(!turnover.contains("500"), "在飞登记不能留在已退出的群上");
+    assert!(
+        annex.lock().await.is_empty(),
+        "上批 annex 缓存不能在退群后留着"
+    );
+    // The ladder is the one table that must survive: it exists to outlive a
+    // session, so a leave/rejoin may not reset it.
+    assert!(
+        resident.has_backoff("500").await,
+        "退避阶梯不能在退群时被抹掉"
+    );
+}
+
+/// Existing per-group keys still work after another group departs.
+#[tokio::test]
+async fn departure_of_one_group_leaves_the_others_alone() {
+    let (intake, store, _dir) = intake().await;
+    store.ensure_group(BOT, "600", 1).await.expect("建组");
+    let resident = Arc::new(crate::app::resident::ResidentManager::new(
+        Arc::clone(&store),
+        BOT.to_string(),
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        String::new(),
+    ));
+    let turnover = Arc::new(crate::app::turn::RunningTurns::new());
+    let annex = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    annex.lock().await.insert(
+        "600".to_string(),
+        crate::app::turn::history::PreviousBatch {
+            conversation_id: "conv-600".to_string(),
+            table: String::new(),
+            targets: Vec::new(),
+            next_ref: 1,
+            own_reply: None,
+        },
+    );
+    let intake = intake
+        .with_resident(Arc::clone(&resident))
+        .with_running_turns(Arc::clone(&turnover))
+        .with_previous_batch(Arc::clone(&annex));
+    intake.handle(&group_event("600", "7", "1", "hi")).await;
+    intake.record_cadence("600", "wait.quiet", 100).await;
+    resident.note_respawn_failure("600", 100).await;
+    resident.arm_retry("600", vec![1]).await;
+    turnover.register("600", 100);
+
+    let _ = intake
+        .handle(&serde_json::json!({
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": "kick_me",
+            "group_id": "500",
+            "user_id": BOT,
+            "self_id": BOT,
+            "time": 1_700_000_001,
+        }))
+        .await;
+
+    assert!(
+        resident.backoff_active("600", 100).await,
+        "别的群退避不能被抹"
+    );
+    assert_eq!(resident.retry_mark("600").await, Some(vec![1]));
+    assert!(turnover.contains("600"));
+    assert!(intake.transient_group_rows() > 0);
+    assert!(
+        annex.lock().await.contains_key("600"),
+        "别的群的 annex 不能被删"
+    );
+}
+
+async fn residency_probe_and_canary(resident: &Arc<crate::app::resident::ResidentManager>) {
+    resident
+        .record_round("500", crate::app::probes::RoundOutcome::default())
+        .await;
+    resident.record_drift("500").await;
+    resident.record_canary("500", true).await;
+    assert!(resident.canary_due("500", 1, 4).await);
+    resident.canary_started("500", 1).await;
+    assert!(!resident.canary_due("500", 1, 4).await);
 }

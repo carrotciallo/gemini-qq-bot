@@ -303,7 +303,7 @@ pub async fn call_submit(store: &SqliteStore, scope: &Scope, args: &Value) -> Va
         Ok(()) => ("accepted", String::new()),
         Err(r) => ("rejected", r.clone()),
     };
-    let _ = store
+    let persisted = store
         .record_submission(
             &scope.group_id,
             &token,
@@ -313,6 +313,17 @@ pub async fn call_submit(store: &SqliteStore, scope: &Scope, args: &Value) -> Va
             now,
         )
         .await;
+    match persisted {
+        Err(_) => return tool_answer("提交未能持久化，请稍后重试。".to_string(), true),
+        Ok((_, false)) if outcome.is_ok() => {
+            return tool_answer(
+                "提交被拒绝：输入代次已改变或窗口已关闭，请使用最新插入卡的 turn_token 重试。"
+                    .to_string(),
+                true,
+            );
+        }
+        _ => {}
+    }
     match outcome {
         Ok(()) => tool_answer("已记录本轮提交。".to_string(), false),
         Err(r) => tool_answer(
@@ -347,32 +358,78 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn contract_field_names() -> std::collections::BTreeSet<String> {
+        // Observe the actual Serde-derived contract metadata. No mirrored list
+        // and no production Serialize implementation added solely for a test.
+        struct Fields<'a>(&'a mut Vec<String>);
+        impl<'de> serde::Deserializer<'de> for Fields<'_> {
+            type Error = serde::de::value::Error;
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("field metadata only"))
+            }
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _name: &'static str,
+                fields: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0.extend(fields.iter().map(|s| (*s).to_string()));
+                Err(serde::de::Error::custom("field metadata collected"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+        let mut fields = Vec::new();
+        let _ = <crate::agent::contract::AgentOutputRaw as serde::Deserialize>::deserialize(
+            Fields(&mut fields),
+        );
+        assert!(
+            !fields.is_empty(),
+            "contract must expose its actual struct metadata"
+        );
+        fields.push("turn_token".into());
+        fields.into_iter().collect()
+    }
+
+    fn schema_field_names(def: &Value) -> std::collections::BTreeSet<String> {
+        def.pointer("/inputSchema/properties")
+            .and_then(Value::as_object)
+            .expect("schema properties")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn schema_fields_match_contract() {
-        // AgentOutputRaw's fields, plus turn_token. When the contract grows
-        // a field, add it to the schema and to this list in the same change.
-        let mut expected = vec![
-            "turn_token",
-            "should_reply",
-            "reply_text",
-            "reply_parts",
-            "nicknames",
-            "mood_update",
-            "topic_state",
-            "memory_ops",
-            "sticker_ops",
-            "quote_ref",
-            "poke_ref",
-        ];
-        let def = tool_definition();
-        let props = def
-            .pointer("/inputSchema/properties")
-            .and_then(Value::as_object)
-            .expect("schema 属性");
-        let mut actual: Vec<&str> = props.keys().map(String::as_str).collect();
-        expected.sort_unstable();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
+        assert_eq!(
+            schema_field_names(&tool_definition()),
+            contract_field_names()
+        );
+    }
+
+    #[test]
+    fn schema_oracle_rejects_a_missing_contract_field() {
+        let mut def = tool_definition();
+        def.pointer_mut("/inputSchema/properties")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("reply_parts");
+        assert_ne!(schema_field_names(&def), contract_field_names());
+    }
+
+    #[test]
+    fn schema_oracle_rejects_a_schema_only_field() {
+        let mut def = tool_definition();
+        def["inputSchema"]["properties"]["not_in_agent_contract"] = json!({"type":"string"});
+        assert_ne!(schema_field_names(&def), contract_field_names());
     }
 
     #[test]
@@ -596,6 +653,99 @@ mod tests {
         let rows = store.submissions_for("tok").await.expect("读提交");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].verdict, "accepted");
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_never_acknowledges_submission() {
+        let (_dir, store) = store().await;
+        store
+            .arm_turn("g", "tok", "batch", now_epoch(), now_epoch() + 600)
+            .await
+            .expect("arm");
+        sqlx::query("CREATE TRIGGER reject_submit BEFORE INSERT ON turn_submissions BEGIN SELECT RAISE(FAIL, 'synthetic-private-db-detail'); END")
+            .execute(store.pool()).await.expect("trigger");
+        let result = call_submit(
+            &store,
+            &scope(),
+            &json!({"turn_token":"tok", "should_reply":false}),
+        )
+        .await;
+        assert!(is_error(&result), "no ACK until durability succeeds");
+        assert!(!result.to_string().contains("synthetic-private-db-detail"));
+        assert!(store.submissions_for("tok").await.expect("rows").is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistence_concurrent_submissions_have_unique_order() {
+        let (_dir, store) = store().await;
+        store
+            .arm_turn("g", "tok", "batch", now_epoch(), now_epoch() + 600)
+            .await
+            .expect("arm");
+        let store = std::sync::Arc::new(store);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                call_submit(
+                    &store,
+                    &scope(),
+                    &json!({"turn_token":"tok", "should_reply":false}),
+                )
+                .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert!(!is_error(&result.expect("task")));
+        }
+        let rows = store.submissions_for("tok").await.expect("rows");
+        assert_eq!(
+            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            (1..=32).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_old_token_does_not_mix_into_new_turn() {
+        let (_dir, store) = store().await;
+        store
+            .arm_turn("g", "old", "first", now_epoch(), now_epoch() + 600)
+            .await
+            .expect("arm");
+        let old = json!({"turn_token":"old", "should_reply":false});
+        assert!(!is_error(&call_submit(&store, &scope(), &old).await));
+        store
+            .arm_turn("g", "new", "second", now_epoch(), now_epoch() + 600)
+            .await
+            .expect("rearm");
+        assert!(is_error(&call_submit(&store, &scope(), &old).await));
+        assert!(
+            store
+                .submissions_for("new")
+                .await
+                .expect("new rows")
+                .is_empty()
+        );
+        assert!(!is_error(
+            &call_submit(
+                &store,
+                &scope(),
+                &json!({"turn_token":"new", "should_reply":false})
+            )
+            .await
+        ));
+        let rows = store.submissions_for("old").await.expect("old rows");
+        assert_eq!(
+            rows.iter().map(|r| r.verdict.as_str()).collect::<Vec<_>>(),
+            ["accepted", "rejected"]
+        );
+        assert_eq!(
+            store.submissions_for("new").await.expect("new rows").len(),
+            1
+        );
     }
 
     #[tokio::test]

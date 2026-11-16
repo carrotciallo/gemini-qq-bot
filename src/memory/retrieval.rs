@@ -74,8 +74,14 @@ pub struct ContextMemory {
     pub memory_ref: String,
     /// `uN` alias of the subject, when the subject is a known member of this group.
     pub subject_ref: Option<String>,
+    /// Schema v1 subject (type + alias) as rendered into the JSON block.
+    pub subject: crate::memory::schema::SubjectV1,
     pub content: String,
     pub kind: String,
+    /// Schema v1 predicate label; empty when the writer gave none.
+    pub slot: String,
+    /// Schema v1 clustering labels.
+    pub tags: Vec<String>,
     /// Ranking score, exposed for tests and the admin view.
     pub score: f64,
     /// True when the entry came from the "fresh" pass.
@@ -101,23 +107,41 @@ impl MemoryContext {
         }
     }
 
-    /// Render the block injected into the prompt.
+    /// Render the block injected into the prompt: one header line and one compact
+    /// schema v1 JSON array. Empty slot/tags are omitted per entry, so a legacy
+    /// row renders as just ref/kind/subject/content.
     pub fn render(&self) -> String {
         let mut out = String::new();
         if self.entries.is_empty() {
             return out;
         }
-        out.push_str("相关记忆条目：\n");
-        for e in &self.entries {
-            let subject = match &e.subject_ref {
-                Some(s) => format!("[{s}]"),
-                None => "[群]".to_string(),
-            };
-            out.push_str(&format!(
-                "- {} {} ({}) {}\n",
-                e.memory_ref, subject, e.kind, e.content
-            ));
-        }
+        let arr: Vec<serde_json::Value> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("ref".into(), e.memory_ref.clone().into());
+                obj.insert("kind".into(), e.kind.clone().into());
+                obj.insert(
+                    "subject".into(),
+                    serde_json::json!({
+                        "type": e.subject.subject_type,
+                        "alias": e.subject.alias,
+                    }),
+                );
+                if !e.slot.is_empty() {
+                    obj.insert("slot".into(), e.slot.clone().into());
+                }
+                obj.insert("content".into(), e.content.clone().into());
+                if !e.tags.is_empty() {
+                    obj.insert("tags".into(), e.tags.clone().into());
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        out.push_str("相关记忆条目（JSON，记忆系统 v1）：\n");
+        out.push_str(&serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into()));
+        out.push('\n');
         out
     }
 
@@ -140,6 +164,9 @@ pub struct RetrievalInput<'a> {
     /// possible without exposing raw ids.
     pub subject_aliases: &'a [(String, String)],
     pub budget: usize,
+    /// Evaluation instant for v1 expiry: a row past `expires_at` never surfaces,
+    /// exactly like an archived one.
+    pub now: i64,
 }
 
 /// Character bigrams of a string, ignoring whitespace. Bigrams give a language
@@ -213,7 +240,11 @@ pub fn build(input: &RetrievalInput<'_>) -> MemoryContext {
     // Ranking pass. Retired rows are dropped here as well as in the store query:
     // this function is also reachable with a hand-built slice (tests, replays).
     let mut scored: Vec<(f64, &MemoryRecord, bool)> = Vec::new();
-    for memory in input.memories.iter().filter(|m| !m.is_archived()) {
+    for memory in input
+        .memories
+        .iter()
+        .filter(|m| !m.is_archived() && !m.is_expired(input.now))
+    {
         if is_operational_memory(&memory.content) {
             continue;
         }
@@ -257,21 +288,16 @@ pub fn build(input: &RetrievalInput<'_>) -> MemoryContext {
         if *score <= 0.0 {
             continue;
         }
-        let cost = memory.content.chars().count() + 24;
+        let cost = entry_cost(memory);
         if used + cost > budget {
             // Skip, don't break: the next entry may well be shorter.
             continue;
         }
         used += cost;
         taken.insert(memory.memory_ref.clone());
-        context.entries.push(ContextMemory {
-            memory_ref: memory.memory_ref.clone(),
-            subject_ref: subject_ref_for(memory, input),
-            content: memory.content.clone(),
-            kind: memory.kind.clone(),
-            score: *score,
-            recent: false,
-        });
+        context
+            .entries
+            .push(context_entry(memory, input, *score, false));
     }
 
     // Pass 2: leftover rows by true recency, not leftover score order.
@@ -292,26 +318,56 @@ pub fn build(input: &RetrievalInput<'_>) -> MemoryContext {
         if recent_added >= MAX_RECENT {
             break;
         }
-        let cost = memory.content.chars().count() + 24;
+        let cost = entry_cost(memory);
         if used + cost > budget {
             continue;
         }
         used += cost;
         taken.insert(memory.memory_ref.clone());
         recent_added += 1;
-        context.entries.push(ContextMemory {
-            memory_ref: memory.memory_ref.clone(),
-            subject_ref: subject_ref_for(memory, input),
-            content: memory.content.clone(),
-            kind: memory.kind.clone(),
-            score: 0.0,
-            recent: true,
-        });
+        context
+            .entries
+            .push(context_entry(memory, input, 0.0, true));
     }
 
     context.empty = context.entries.is_empty();
     context.chars = if context.empty { 0 } else { used };
     context
+}
+
+/// Rendered-size estimate for one entry in the v1 JSON block.
+fn entry_cost(memory: &MemoryRecord) -> usize {
+    memory.content.chars().count()
+        + memory.slot.chars().count()
+        + memory
+            .tags
+            .iter()
+            .map(|t| t.chars().count() + 3)
+            .sum::<usize>()
+        + 48
+}
+
+/// Build one context entry from a stored row, deriving the v1 subject through
+/// the same renderer the migration tool uses so both surfaces agree.
+fn context_entry(
+    memory: &MemoryRecord,
+    input: &RetrievalInput<'_>,
+    score: f64,
+    recent: bool,
+) -> ContextMemory {
+    let alias = subject_ref_for(memory, input);
+    let v1 = crate::memory::schema::MemoryV1::from_record(memory, alias.as_deref());
+    ContextMemory {
+        memory_ref: memory.memory_ref.clone(),
+        subject_ref: alias,
+        subject: v1.subject,
+        content: memory.content.clone(),
+        kind: memory.kind.clone(),
+        slot: v1.slot,
+        tags: v1.tags,
+        score,
+        recent,
+    }
 }
 
 /// Runtime bookkeeping that hy3 stored as a fact. It is not about anyone in
@@ -350,6 +406,12 @@ mod tests {
             archived_at: None,
             created_at: updated,
             updated_at: updated,
+            slot: String::new(),
+            tags: Vec::new(),
+            expires_at: None,
+            state: "active".to_string(),
+            superseded_by: None,
+            state_changed_at: None,
         }
     }
 
@@ -365,6 +427,7 @@ mod tests {
             speaker_refs: speakers,
             subject_aliases: aliases,
             budget: DEFAULT_BUDGET,
+            now: 1_000_000,
         }
     }
 
@@ -476,7 +539,7 @@ mod tests {
         let rendered = ctx.render();
         assert!(!rendered.contains("本群记忆摘要"));
         assert!(!rendered.contains("未找到与本批消息相关的记忆条目"));
-        assert!(rendered.starts_with("相关记忆条目："));
+        assert!(rendered.starts_with("相关记忆条目（JSON，记忆系统 v1）："));
     }
 
     #[test]
@@ -506,7 +569,8 @@ mod tests {
         let memories = vec![memory("mem_a", "咖啡", Some("999"), 100)];
         let ctx = build(&input(&memories, "咖啡", &[], &[]));
         assert!(ctx.entries[0].subject_ref.is_none());
-        assert!(ctx.render().contains("[群]"));
+        // 主体别名解析不出来时按群级渲染（v1 JSON 的 group 主体）。
+        assert!(ctx.render().contains("\"type\":\"group\""));
     }
 
     #[test]
@@ -596,6 +660,46 @@ mod tests {
         ];
         let ctx = build(&input(&memories, "zzz", &[], &[]));
         assert!(ctx.empty);
+    }
+
+    #[test]
+    fn expired_rows_never_surface() {
+        let mut row = memory("mem_old", "过期的聚会安排", None, 10);
+        row.expires_at = Some(999_999);
+        let live = memory("mem_new", "还没过期的聚会安排", None, 10);
+        let rows = vec![row, live];
+        let ctx = build(&input(&rows, "聚会安排", &[], &[]));
+        assert_eq!(ctx.entries.len(), 1);
+        assert_eq!(ctx.entries[0].memory_ref, "mem_new");
+    }
+
+    #[test]
+    fn render_is_compact_v1_json() {
+        let mut row = memory("mem_j", "只认可成品", Some("42"), 10);
+        row.slot = "高达模型取向".into();
+        row.tags = vec!["高达".into()];
+        let rows = vec![row];
+        let aliases = vec![("42".to_string(), "u3".to_string())];
+        let speakers = vec!["u3".to_string()];
+        let ctx = build(&RetrievalInput {
+            memories: &rows,
+            query_text: "高达 成品",
+            speaker_refs: &speakers,
+            subject_aliases: &aliases,
+            budget: DEFAULT_BUDGET,
+            now: 1_000_000,
+        });
+        let rendered = ctx.render();
+        assert!(rendered.starts_with("相关记忆条目（JSON，记忆系统 v1）：\n["));
+        let body: serde_json::Value =
+            serde_json::from_str(rendered.lines().nth(1).expect("第二行是 JSON"))
+                .expect("合法 JSON");
+        let first = &body[0];
+        assert_eq!(first["ref"], "mem_j");
+        assert_eq!(first["slot"], "高达模型取向");
+        assert_eq!(first["tags"][0], "高达");
+        assert_eq!(first["subject"]["type"], "user");
+        assert_eq!(first["subject"]["alias"], "u3");
     }
 
     #[test]

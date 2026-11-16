@@ -155,6 +155,10 @@ pub struct PromptBatch {
     /// batch. `None` unless this batch is the first claim after a drain
     /// (or the summary landed late, after that claim already left).
     pub flood_background: Option<String>,
+    /// Spontaneous-topic card (schema v1): this batch exists because the
+    /// engine asked her to open on a topic after a long silence. Rendered as
+    /// its own block ahead of the batch. `None` on human-triggered batches.
+    pub spontaneous: Option<crate::pipeline::scheduler::SpontaneousBrief>,
     /// MCP output channel: this turn's submission token, rendered into the
     /// contract card so the model can present it to `submit_reply`. `None`
     /// on the text channel, where the card renders in its text form.
@@ -347,6 +351,17 @@ pub fn render(batch: &PromptBatch) -> String {
         out.push_str(background.trim());
         out.push_str("\n\n");
     }
+    if let Some(brief) = &batch.spontaneous {
+        out.push_str("# 自发话题\n");
+        out.push_str(
+            "群里安静了一阵，这一轮是你主动挑起话题，不是在回答谁。围绕下面这个话题，像群友随口起话那样自然地开个头：不要提系统、触发机制或安静了多久这类幕后信息，也不要说「没人说话」之类的话。要是你觉得这个话题实在不合时宜、或者现在开口很怪，可以按契约 should_reply=false 什么都不发——沉默也完全可以。\n",
+        );
+        out.push_str(&format!("话题：{}", brief.topic.trim()));
+        if !brief.angle.trim().is_empty() {
+            out.push_str(&format!("\n切入角度：{}", brief.angle.trim()));
+        }
+        out.push_str("\n\n");
+    }
     out.push_str("# 待处理消息\n");
     if batch.messages.is_empty() {
         out.push_str("（无）\n");
@@ -483,7 +498,7 @@ pub const CONTRACT_CARD: &str = "# 合约速记（照此输出）\n\
 - 不想说：{\"should_reply\":false}，其余字段可省。\n\
 - 闲聊轮次默认带一张表情：sticker_ops 里 send 本轮候选中的一张，跟在话后面发；正经答题、气氛严肃、或上一轮刚发过才免。只发一张，不要连发。\n\
 - reply_parts 最多 8 段、合计 ≤1000 字、纯文本无 CQ 码；逐段引用才写对象形，quote_echo 逐字摘自目标原文（≤8 字）。\n\
-- ref 只用本批出现过的 m/h 编号、u 别名与 mem_ 记忆键，不编造；memory_ops 只用于纠错，update 必须带 memory_ref。\n\
+- ref 只用本批出现过的 m/h 编号、u 别名与 mem_ 记忆键，不编造；memory_ops 用于记录与纠错，update / retire 必须带 memory_ref。\n\
 - 时间以本轮标注为准：提示词顶部的「现在」是本轮组批时刻，消息行首的 [HH:MM] 是那条消息的到达时刻。不要自己推算或编造时间、日期、星期。\n\
 - 可以戳一下：poke_ref 填本批某个 speaker_ref，系统会替你戳他一下（打招呼、催他回话、开个玩笑）。一轮最多一个，should_reply 必须为 true；想纯戳不说话就 reply_parts 留空、只带 poke_ref 和贴纸。别连戳，也别拿来骚扰人。";
 

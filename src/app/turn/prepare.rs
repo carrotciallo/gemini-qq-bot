@@ -63,9 +63,9 @@ impl TurnExecutor {
         if queries.is_empty() {
             return Vec::new();
         }
-        // What the group has just seen. Damping a repeat is the whole point here, so a
-        // lookup failure falls back to "nothing was sent recently" rather than to a
-        // failed turn: a stale offer is a worse menu, not a broken one.
+        // What the group has just seen. Cooling and dividing repeats is the whole
+        // point here, so a lookup failure falls back to "nothing was sent recently"
+        // rather than to a failed turn: a stale offer is a worse menu, not a broken one.
         let group_id = messages
             .first()
             .map(|message| message.group_id.as_str())
@@ -78,8 +78,21 @@ impl TurnExecutor {
                 .await
                 .unwrap_or_default(),
         };
-        let just_now: Vec<String> = recent.iter().map(|(hash, _, _)| hash.clone()).collect();
-        let mut scored: Vec<(f64, &crate::store::StickerRecord)> = library
+        // A6 anti-repeat inputs, all from the same recent-sends read: the
+        // newest `OFFER_COOLDOWN_SENDS` hashes form the hard cooldown, and
+        // each hash's count inside the window feeds the frequency divisor.
+        // The ranking itself lives in `rank_offer_candidates`.
+        let recent_hashes: Vec<String> = recent.iter().map(|(hash, _, _)| hash.clone()).collect();
+        let cooldown: Vec<String> = recent_hashes
+            .iter()
+            .take(OFFER_COOLDOWN_SENDS)
+            .cloned()
+            .collect();
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for hash in &recent_hashes {
+            *counts.entry(hash.clone()).or_default() += 1;
+        }
+        let raw_scored: Vec<(f64, &crate::store::StickerRecord)> = library
             .iter()
             .filter_map(|record| {
                 let fields = record.text();
@@ -87,38 +100,11 @@ impl TurnExecutor {
                     .iter()
                     .map(|query| crate::memory::stickers::score_text(query, &fields))
                     .fold(0.0_f64, f64::max);
-                // A5: a repeat is damped (RECENT_SEND_DAMPING). This is a discount,
-                // not a ban — on a quiet shelf a strong match still clears
-                // `OFFER_MIN_SCORE` after damping, and the shelf answer has to stay
-                // usable rather than go empty.
-                let best = match just_now.iter().any(|hash| hash == &record.hash) {
-                    true => raw * crate::memory::stickers::RECENT_SEND_DAMPING,
-                    false => raw,
-                };
-                (best >= crate::memory::stickers::OFFER_MIN_SCORE).then_some((best, record))
+                (raw >= crate::memory::stickers::OFFER_MIN_SCORE).then_some((raw, record))
             })
             .collect();
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.hash.cmp(&b.1.hash))
-        });
-        let over_threshold: Vec<String> = scored.iter().map(|(_, row)| row.hash.clone()).collect();
-        let mut picked = pick_diverse(&scored);
-        // A4 fallback with an A5 vest: when the batch did match something but has room,
-        // one proven pick rides along — unless it just went out and a fresher
-        // over-threshold row can take the slot. Silently skipped on any lookup error:
-        // the shelf answer is never worth failing a turn over.
-        if !picked.is_empty() && picked.len() < MAX_STICKER_OFFERS && !group_id.is_empty() {
-            let ranked = self.sent_sticker_ranking(group_id).await;
-            let taken: Vec<String> = picked.iter().map(|record| record.hash.clone()).collect();
-            let just_sent = rounds_just_sent(&recent);
-            if let Some(choice) = habit_pick(&ranked, &just_sent, &over_threshold, &taken)
-                && let Some(record) = library.iter().find(|row| row.hash == choice)
-            {
-                picked.push(record);
-            }
-        }
+        let scored = rank_offer_candidates(&raw_scored, &cooldown, &counts);
+        let picked = pick_diverse(&scored);
         picked
             .into_iter()
             .map(|record| crate::agent::prompt::StickerOffer {
@@ -136,28 +122,6 @@ impl TurnExecutor {
                 ),
             })
             .collect()
-    }
-
-    /// The group's sent stickers, most-sent first (A4).
-    ///
-    /// Read straight from the outbox instead of a stored counter so it tracks what
-    /// really went out, deliveries included. The whole ranking comes back (capped by
-    /// [`OFFER_SCAN_LIMIT`]) because A5 may need the runner-up when the top one just
-    /// went out. Empty on any error: a missing habit signal is a weaker menu, not a
-    /// broken turn.
-    pub(super) async fn sent_sticker_ranking(&self, group_id: &str) -> Vec<String> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT sticker_hash, COUNT(*) AS sends FROM outbox \
-             WHERE bot_id = ? AND group_id = ? AND state = 'sent' AND sticker_hash IS NOT NULL \
-             GROUP BY sticker_hash ORDER BY sends DESC, sticker_hash ASC LIMIT ?",
-        )
-        .bind(&self.bot_id)
-        .bind(group_id)
-        .bind(OFFER_SCAN_LIMIT)
-        .fetch_all(self.store.pool())
-        .await
-        .unwrap_or_default();
-        rows.into_iter().map(|(hash, _)| hash).collect()
     }
 
     pub(super) async fn persist_tagged_images(
@@ -238,6 +202,29 @@ impl TurnExecutor {
         group: &crate::store::GroupRecord,
         now: i64,
     ) -> Result<PreparedTurn, TurnResult> {
+        // Load this operator constraint before preparing any memory context.
+        // An unavailable list is not an empty list and must not arm a turn.
+        let sealed_topics = match self
+            .store
+            .list_sealed_topics(&self.bot_id, &job.group_id)
+            .await
+        {
+            Ok(topics) => topics,
+            Err(_) => {
+                let _ = self.store.release_events(&job.event_ids).await;
+                let _ = self
+                    .store
+                    .audit(
+                        "system",
+                        "memory.sealed_topics_unavailable",
+                        Some(&self.bot_id),
+                        Some(&job.group_id),
+                        now,
+                    )
+                    .await;
+                return Err(TurnResult::AgentFailed);
+            }
+        };
         // 3. Load the pending payloads for this batch.
         let payloads = match self.load_payloads(&job.event_ids).await {
             Some(p) if !p.is_empty() => p,
@@ -380,6 +367,7 @@ impl TurnExecutor {
             speaker_refs: &speaker_refs,
             subject_aliases: &aliases,
             budget: self.context_builder.budget,
+            now,
         });
 
         // §5.6 digested view. The summary was computed during the pacing gate's wait (in
@@ -553,9 +541,13 @@ impl TurnExecutor {
             sticker_offers,
             &quote_summaries,
         );
+        // Sealed topics for contract validation ([seal-2]): the pure batch
+        // builder cannot read the store, so the caller loads the list.
+        scope.sealed_topics = sealed_topics;
         prompt_batch.digest = digest_text;
         prompt_batch.flooded = job.flooded;
         prompt_batch.flood_background = job.flood_background.clone();
+        prompt_batch.spontaneous = job.spontaneous.clone();
         // An update still needs its key to survive validation, so every key the digest
         // exposed is accepted even if the digest's own pass picked it up through an
         // expansion term the batch text alone would not have surfaced.

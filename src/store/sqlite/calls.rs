@@ -63,25 +63,28 @@ impl SqliteStore {
 
     /// Record the P4 counters for one resident round.
     ///
-    /// These are diagnostics only: `steps_count` is how many steps the step stream
-    /// held when the round finished, `insert_count` how many extra batches the turn
-    /// absorbed, and `draft_count` how many agent drafts the barrier withheld. They
-    /// are written after `finish_call` so a row keeps its state history intact.
-    /// A row that never got past preparation leaves all three null: there was no
-    /// step stream to count.
+    /// These are diagnostics only. `steps_count` is the session cumulative event
+    /// count, `turn_steps_count` the delta of the round that just finished (they
+    /// differ because one resident call spans many batches), `last_progress_step`
+    /// the idx of the last step observed, `insert_count` how many extra batches
+    /// the turn absorbed, and `draft_count` how many agent drafts the barrier
+    /// withheld. They are written after `finish_call` so a row keeps its state
+    /// history intact. A row that never got past preparation leaves all of them
+    /// null: there was no step stream to count.
     pub async fn record_resident_counts(
         &self,
         id: &str,
-        steps_count: i64,
-        insert_count: i64,
-        draft_count: i64,
+        counts: crate::store::ResidentCounts,
     ) -> BotResult<()> {
         sqlx::query(
-            "UPDATE agent_calls SET steps_count = ?, insert_count = ?, draft_count = ? WHERE id = ?",
+            "UPDATE agent_calls SET steps_count = ?, turn_steps_count = ?, last_progress_step = ?, \
+             insert_count = ?, draft_count = ? WHERE id = ?",
         )
-        .bind(steps_count)
-        .bind(insert_count)
-        .bind(draft_count)
+        .bind(counts.session_events)
+        .bind(counts.turn_delta)
+        .bind(counts.last_progress_idx)
+        .bind(counts.insert_count)
+        .bind(counts.draft_count)
         .bind(id)
         .execute(&self.pool)
         .await?;

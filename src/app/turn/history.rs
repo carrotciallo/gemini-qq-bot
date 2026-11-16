@@ -329,7 +329,7 @@ pub async fn seed_brief_for(
             .await
             .ok()
             .flatten()
-            .map(|row| row.summary_text)
+            .map(|row| crate::memory::compaction::summary_display_text(&row.summary_text))
             .filter(|summary| !summary.trim().is_empty())
     } else {
         Some(chunk_segments.join("\n"))

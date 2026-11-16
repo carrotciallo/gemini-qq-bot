@@ -116,23 +116,20 @@ impl Outbox {
     ) -> crate::error::BotResult<Vec<String>> {
         let total = parts.len() + sticker_hashes.len();
         let count = i64::try_from(total).unwrap_or(i64::MAX);
-        let mut ids = Vec::with_capacity(total);
+        let mut rows = Vec::with_capacity(total);
         for (index, text) in parts.iter().enumerate() {
-            let id = self
-                .store
-                .enqueue_outbox_part(crate::store::OutboxPart {
-                    bot_id,
-                    group_id,
-                    batch_id,
-                    text,
-                    part_index: i64::try_from(index).unwrap_or(i64::MAX),
-                    part_count: count,
-                    now,
-                    sticker_hash: None,
-                    quote_message_id: part_quotes.get(index).copied().flatten(),
-                })
-                .await?;
-            ids.push(id);
+            rows.push(crate::store::OutboxPart {
+                bot_id,
+                group_id,
+                batch_id,
+                text,
+                part_index: i64::try_from(index).unwrap_or(i64::MAX),
+                part_count: count,
+                now,
+                sticker_hash: None,
+                image_file: None,
+                quote_message_id: part_quotes.get(index).copied().flatten(),
+            });
         }
         let mut sticker_quote = if parts.is_empty() {
             part_quotes.first().copied().flatten()
@@ -141,23 +138,59 @@ impl Outbox {
         };
         for (offset, hash) in sticker_hashes.iter().enumerate() {
             let index = parts.len() + offset;
-            let id = self
-                .store
-                .enqueue_outbox_part(crate::store::OutboxPart {
-                    bot_id,
-                    group_id,
-                    batch_id,
-                    text: "",
-                    part_index: i64::try_from(index).unwrap_or(i64::MAX),
-                    part_count: count,
-                    now,
-                    sticker_hash: Some(hash.as_str()),
-                    quote_message_id: sticker_quote.take(),
-                })
-                .await?;
-            ids.push(id);
+            rows.push(crate::store::OutboxPart {
+                bot_id,
+                group_id,
+                batch_id,
+                text: "",
+                part_index: i64::try_from(index).unwrap_or(i64::MAX),
+                part_count: count,
+                now,
+                sticker_hash: Some(hash.as_str()),
+                image_file: None,
+                quote_message_id: sticker_quote.take(),
+            });
         }
-        Ok(ids)
+        self.store.enqueue_outbox_parts(&rows).await
+    }
+
+    /// Persist one generated picture, with an optional caption part ahead of
+    /// it. The picture's bytes stay on disk under the imagegen output
+    /// directory; the row carries only the bare file name.
+    pub async fn enqueue_image(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        batch_id: &str,
+        caption: Option<&str>,
+        image_file: &str,
+        now: i64,
+    ) -> crate::error::BotResult<Vec<String>> {
+        let rows = image_parts(bot_id, group_id, batch_id, caption, image_file, now);
+        self.store.enqueue_outbox_parts(&rows).await
+    }
+
+    /// The job becomes succeeded (generation durably queued, not sent) in
+    /// the same transaction that creates all of its delivery rows.
+    pub async fn enqueue_generated_image(
+        &self,
+        job: &crate::store::ImageJob,
+        caption: Option<&str>,
+        image_file: &str,
+        file_path: &str,
+        now: i64,
+    ) -> crate::error::BotResult<Vec<String>> {
+        let rows = image_parts(
+            &job.bot_id,
+            &job.group_id,
+            &job.id,
+            caption,
+            image_file,
+            now,
+        );
+        self.store
+            .commit_generated_image(job, &rows, file_path, now)
+            .await
     }
 
     /// Mark a row `sending` immediately before the network call.
@@ -201,6 +234,46 @@ impl Outbox {
     }
 }
 
+fn image_parts<'a>(
+    bot_id: &'a str,
+    group_id: &'a str,
+    batch_id: &'a str,
+    caption: Option<&'a str>,
+    image_file: &'a str,
+    now: i64,
+) -> Vec<crate::store::OutboxPart<'a>> {
+    let caption = caption.map(str::trim).filter(|s| !s.is_empty());
+    let count = if caption.is_some() { 2 } else { 1 };
+    let mut rows = Vec::with_capacity(count as usize);
+    if let Some(text) = caption {
+        rows.push(crate::store::OutboxPart {
+            bot_id,
+            group_id,
+            batch_id,
+            text,
+            part_index: 0,
+            part_count: count,
+            now,
+            sticker_hash: None,
+            image_file: None,
+            quote_message_id: None,
+        });
+    }
+    rows.push(crate::store::OutboxPart {
+        bot_id,
+        group_id,
+        batch_id,
+        text: "",
+        part_index: i64::from(caption.is_some()),
+        part_count: count,
+        now,
+        sticker_hash: None,
+        image_file: Some(image_file),
+        quote_message_id: None,
+    });
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +286,42 @@ mod tests {
         let store = Arc::new(SqliteStore::new(pool));
         store.ensure_group("1", "100", 10).await.expect("建群");
         (store, dir)
+    }
+
+    #[tokio::test]
+    async fn atomic_outbox_second_part_failure_leaves_no_prefix() {
+        let (store, _dir) = store().await;
+        sqlx::query("CREATE TRIGGER fail_second BEFORE INSERT ON outbox WHEN NEW.part_index = 1 BEGIN SELECT RAISE(ABORT, 'fixture-second-part'); END")
+            .execute(store.pool()).await.unwrap();
+        let outbox = Outbox::new(store.clone());
+        assert!(
+            outbox
+                .enqueue_mixed(
+                    "1",
+                    "100",
+                    "mixed",
+                    &["hello".into()],
+                    &["sticker".into()],
+                    &[Some("quote")],
+                    20
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            outbox.deliverable(10).await.unwrap().is_empty(),
+            "mixed prefix survived rollback"
+        );
+        assert!(
+            outbox
+                .enqueue_image("1", "100", "image", Some("caption"), "job.jpg", 20)
+                .await
+                .is_err()
+        );
+        assert!(
+            outbox.deliverable(10).await.unwrap().is_empty(),
+            "caption survived rollback"
+        );
     }
 
     #[test]
@@ -362,6 +471,36 @@ mod tests {
         let row = store.get_outbox(&id).await.expect("读").expect("存在");
         assert_eq!(row.state, "unknown");
         assert!(outbox.deliverable(10).await.expect("读").is_empty());
+    }
+
+    #[tokio::test]
+    async fn image_row_carries_its_file_name_and_caption_goes_first() {
+        let (store, _dir) = store().await;
+        let outbox = Outbox::new(Arc::clone(&store));
+        let ids = outbox
+            .enqueue_image("1", "100", "img1", Some("画好了"), "job_abc.jpg", 40)
+            .await
+            .expect("入队");
+        assert_eq!(ids.len(), 2);
+        let rows = outbox.deliverable(10).await.expect("读");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, "text");
+        assert_eq!(rows[0].text, "画好了");
+        assert_eq!(rows[1].kind, "image");
+        // The locator rides in `text`, like a sticker's hash identifies bytes.
+        assert_eq!(rows[1].text, "job_abc.jpg");
+        assert_eq!(rows[1].part_index, 1);
+        assert_eq!(rows[1].part_count, 2);
+
+        // No caption: the image is the only part.
+        let ids = outbox
+            .enqueue_image("1", "100", "img2", None, "job_def.jpg", 50)
+            .await
+            .expect("入队");
+        assert_eq!(ids.len(), 1);
+        let row = store.get_outbox(&ids[0]).await.expect("读").expect("存在");
+        assert_eq!(row.kind, "image");
+        assert_eq!(row.part_count, 1);
     }
 
     #[tokio::test]

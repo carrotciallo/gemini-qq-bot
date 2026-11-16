@@ -7,6 +7,7 @@
 //! behind the proxy/agent gates.
 
 pub mod damper;
+pub mod imagegen;
 pub mod insert;
 pub mod intake;
 pub mod pacing;
@@ -15,6 +16,7 @@ pub mod probes;
 pub mod relevance;
 pub mod resident;
 pub mod runtime_settings;
+pub mod spontaneous;
 pub mod sticker_gate;
 pub mod turn;
 
@@ -29,6 +31,7 @@ use crate::agent::agy::AgyPermissions;
 use crate::config::Config;
 use crate::error::{BotError, BotResult};
 use crate::health::{AgyHealth, HealthRegistry, HealthSnapshot, OneBotHealth, OwnerStatus};
+use crate::integrations::agy_aux::{AgyAuxClient, AgyAuxConfig};
 use crate::integrations::aux_gateway::{AuxGatewayConfig, AuxGatewayStatus};
 use crate::integrations::aux_llm::AuxLlm;
 use crate::integrations::aux_slot::{AgyAuxParams, AuxSlot, build_provider};
@@ -68,9 +71,12 @@ pub struct App {
     pub health: Arc<HealthRegistry>,
     pub mihomo: Arc<Mihomo>,
     pub aux: Arc<dyn AuxLlm>,
-    /// The swappable provider behind `aux` / `summary_model`: the settings
-    /// API replaces the backend inside the slot at runtime.
+    /// The swappable provider behind `aux` (the chat-side face): the
+    /// settings API replaces the backend inside the slot at runtime.
+    /// Memory work no longer rides this slot (memfix [mf-2]).
     pub aux_slot: Arc<AuxSlot>,
+    /// The memory-judgement backend (compaction, folds, consolidation,
+    /// digest, handover): one dedicated Agy session, fixed at startup.
     pub summary_model: Arc<dyn crate::memory::compaction::SummaryModel>,
     /// Runtime settings (overlay plus the live handles it steers).
     pub settings: Arc<RuntimeSettings>,
@@ -126,6 +132,10 @@ impl App {
         let _ = store.reconcile_jobs(now).await;
         let _ = store.reconcile_outbox(now).await;
         let _ = store.prune_seen(now - 7 * 86_400).await;
+        // The MCP server process reads only the database, so the owner id
+        // from the file config is mirrored into the imagegen settings row
+        // for its quota gate to see.
+        let _ = store.set_imagegen_owner(&config.owner_qq_id, now).await;
 
         let mihomo = Arc::new(Mihomo::new(
             MihomoConfig {
@@ -169,10 +179,22 @@ impl App {
         // dual-mode design): the gateway when it is enabled, otherwise one
         // dedicated Agy session. There is no third, unprovisioned state.
         // The slot lets the settings API swap the provider at runtime.
+        // It backs the chat-side AuxLlm face only.
         let aux_slot = Arc::new(AuxSlot::new(build_provider(aux_config, &agy_aux_params)));
         let aux = Arc::clone(&aux_slot) as Arc<dyn AuxLlm>;
-        let summary_model =
-            Arc::clone(&aux_slot) as Arc<dyn crate::memory::compaction::SummaryModel>;
+        // Memory judgement runs on its own dedicated Agy session (memfix
+        // [mf-2]): summaries, folds and consolidation moved off the aux
+        // gateway entirely — the same mind that holds the memories
+        // maintains them. The workspace is separate from the aux
+        // fallback's `__aux__` so a runtime aux swap can never put two
+        // resident sessions on one workspace.
+        let summary_model = Arc::new(AgyAuxClient::new(AgyAuxConfig {
+            bin: agy_aux_params.bin.clone(),
+            home: agy_aux_params.home.clone(),
+            workspace: config.agy_projects_dir.join("__memory__"),
+            model: agy_aux_params.model.clone(),
+            turn_limit: agy_aux_params.turn_limit,
+        })) as Arc<dyn crate::memory::compaction::SummaryModel>;
 
         // Panel quota card: reads the Agy account's Gemini buckets. It talks
         // to Google directly, so it rides the same Mihomo proxy the agent
@@ -203,13 +225,16 @@ impl App {
         snapshot.recompute();
         let health = Arc::new(HealthRegistry::new(snapshot));
 
-        let compactor = Arc::new(CompactionScheduler::new(
-            Arc::clone(&store),
-            CompactionThresholds {
-                daily_limit: i64::from(config.file.compaction_daily_limit),
-                ..CompactionThresholds::default()
-            },
-        ));
+        let compactor = Arc::new(
+            CompactionScheduler::new(
+                Arc::clone(&store),
+                CompactionThresholds {
+                    daily_limit: i64::from(config.file.compaction_daily_limit),
+                    ..CompactionThresholds::default()
+                },
+            )
+            .with_summary_model_label(config.agy_model.clone()),
+        );
 
         let (connection_supervisor, connection) = Connection::new(
             config.onebot_ws_url.clone(),
@@ -241,7 +266,7 @@ impl App {
         // handed to the turn that follows. One engine, shared by the intake (which
         // launches it inside the already-existing gate wait) and the executor (which
         // consumes it, or falls back to the raw entry list). The summariser is
-        // whichever aux backend the mode selected above.
+        // the dedicated memory session (memfix [mf-2]).
         let digest = Arc::new(crate::memory::DigestEngine::new(
             Arc::clone(&store),
             config.bot_id.clone(),
@@ -266,6 +291,12 @@ impl App {
         );
 
         let running_turns = Arc::new(turn::RunningTurns::new());
+        // One annex cache shared by the executor (writer) and the intake
+        // (lifecycle cleaner): a departed group's previous batch must not
+        // outlive the conversation it described.
+        let previous_batch: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, turn::PreviousBatch>>,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         // Group enablement lives in the database, not in the environment: a new group
         // is discovered disabled and an operator switches it on from the panel. There
@@ -284,7 +315,8 @@ impl App {
             .with_call_names(config.file.bot_call_names.clone())
             .with_resident(Arc::clone(&resident))
             .with_connection(connection.clone())
-            .with_running_turns(Arc::clone(&running_turns)),
+            .with_running_turns(Arc::clone(&running_turns))
+            .with_previous_batch(Arc::clone(&previous_batch)),
         );
 
         // The gate always exists: the aux layer always has a provider
@@ -339,7 +371,7 @@ impl App {
             // Per-process, per-group annex cache: the previous batch of a resident
             // conversation, so the next turn's model can still point at those
             // messages without their stale `mN` names.
-            previous_batch: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            previous_batch: Arc::clone(&previous_batch),
             digest: Some(digest.clone()),
             store: Arc::clone(&store),
             connection: connection.clone(),
@@ -358,7 +390,7 @@ impl App {
             media_fetcher: Arc::new(crate::media::HttpFetcher::new(
                 config.media_origins.clone(),
                 config.media_max_bytes,
-            )),
+            )?),
             media_max_bytes: config.media_max_bytes,
             media_max_pixels: config.media_max_pixels,
             // The image path talks to the same gate, reached through the trait so a
@@ -369,6 +401,7 @@ impl App {
             preflight,
             hourly_call_budget: config.file.hourly_call_budget,
             sticker_dir: config.sticker_dir.clone(),
+            imagegen_dir: config.imagegen_dir.clone(),
             agy_projects_dir: config.agy_projects_dir.clone(),
             // Loaded once here rather than at send time: a missing file is normal in
             // tests, so it simply contributes nothing.
@@ -530,6 +563,25 @@ impl App {
             supervisor.run(intake).await;
         });
 
+        // Image generation executor: claims `generate_image` jobs and draws
+        // them one at a time in the background (see app::imagegen).
+        let imagegen = Arc::new(crate::app::imagegen::ImagegenExecutor::new(
+            Arc::clone(&self.store),
+            self.connection.clone(),
+            self.config.bot_id.clone(),
+            self.config.imagegen_dir.clone(),
+            self.config.imagegen_bin.clone(),
+            self.config.imagegen_home.clone(),
+            self.config.persona_dir.clone(),
+            self.config.imagegen_backend.clone(),
+            self.config.imagegen_web_url.clone(),
+            self.config.imagegen_web_token.clone(),
+            self.executor.secrets.clone(),
+        ));
+        tokio::spawn(async move {
+            imagegen.run().await;
+        });
+
         // Flush loop: claim batches and hand them to per-group lanes.
         let flush_self = Arc::clone(&self);
         tokio::spawn(async move {
@@ -623,9 +675,10 @@ impl App {
             }
         });
 
-        // L3 memory compaction is panel-only: the derived summary is not injected into
-        // the agent prompt, so an automatic loop would spend Aux tokens for a
-        // panel page nobody is looking at.
+        // L3 compaction auto-runs inside the fold loop below (schema v1): the
+        // structured summary now feeds the spontaneous-topic picker and the seed
+        // brief, not just the panel page. The scheduler's thresholds, 24h
+        // cooldown and daily cap still gate every run.
 
         // Background log folding: keep the raw log bounded by summarising its oldest
         // tail into `memory_chunks`. Runs before memory compaction so a fold never races
@@ -636,14 +689,16 @@ impl App {
                 crate::memory::consolidate::Consolidator::new(Arc::clone(&chunk_self.store));
             loop {
                 tokio::time::sleep(FOLD_INTERVAL).await;
-                // Rebuilt each round so a hot-swapped aux provider's origin
-                // and model label apply from the next fold on.
+                // The fold's model work runs on the memory session, so its
+                // rows are written under that backend's origin and label;
+                // since memfix [mf-2] they no longer follow the aux slot.
+                // There is deliberately no health gate here (2026-11-11):
+                // the memory session's health flag is last-call-derived, so
+                // gating on it would deadlock the loop after one failure —
+                // and the gateway's health is irrelevant to this loop now.
+                // Every stage below already fails soft per group.
                 let chunker = crate::memory::chunker::Chunker::new(Arc::clone(&chunk_self.store))
-                    .with_origin(chunk_self.aux_slot.origin())
-                    .with_model_label(chunk_self.aux_slot.model_label());
-                if !chunk_self.aux.healthy().await {
-                    continue;
-                }
+                    .with_model_label(chunk_self.config.agy_model.clone());
                 let groups = chunk_self
                     .store
                     .list_groups(&chunk_self.config.bot_id)
@@ -688,6 +743,31 @@ impl App {
                             crate::now_unix(),
                         )
                         .await;
+                    // TTL expire sweep (schema v1, light tier): retire rows whose
+                    // expiry passed. Pure Rust, no model call; runs before the
+                    // compaction gate below so the summary never reads dead rows.
+                    // Panel rows are exempt inside the store method.
+                    if let Ok(expired) = chunk_self
+                        .store
+                        .archive_expired_memories(
+                            &chunk_self.config.bot_id,
+                            &group.group_id,
+                            crate::now_unix(),
+                        )
+                        .await
+                        && expired > 0
+                    {
+                        let _ = chunk_self
+                            .store
+                            .audit(
+                                crate::store::origin::audit_actor(crate::store::origin::HY3),
+                                &format!("memory.expire.g{}.n{}", group.group_id, expired),
+                                Some(&chunk_self.config.bot_id),
+                                Some(&group.group_id),
+                                crate::now_unix(),
+                            )
+                            .await;
+                    }
                     // Second-pass memory consolidation (§5.6 forgetting): fold a subject
                     // cluster back down once a group carries enough active rows. Placed
                     // after the fold so a merge never races the extraction that the fold
@@ -710,6 +790,31 @@ impl App {
                         crate::now_unix(),
                     )
                     .await;
+                    // L3 compaction (schema v1, heavy tier): the scheduler gates on
+                    // thresholds (>50 rows or >8000 chars), the 24h cooldown and the
+                    // configured daily cap; the global slot keeps concurrency at 1.
+                    // Manual panel runs share the same scheduler and daily cap.
+                    if let crate::memory::compaction::CompactionDecision::Queued(job) = chunk_self
+                        .compactor
+                        .maybe_queue(
+                            &chunk_self.config.bot_id,
+                            &group.group_id,
+                            crate::store::ActorKind::System,
+                            crate::now_unix(),
+                            false,
+                        )
+                        .await
+                        && let Some(_slot) = chunk_self.compactor.try_lock()
+                    {
+                        let job_aliases: Vec<(String, String)> = aliases
+                            .iter()
+                            .map(|(alias, user_id)| (user_id.clone(), alias.clone()))
+                            .collect();
+                        let _ = chunk_self
+                            .compactor
+                            .run_job(&job, Arc::clone(&model), job_aliases, crate::now_unix())
+                            .await;
+                    }
                     // Rolling handover note: keeps the live thread (open
                     // questions, promises, running bits) written down outside
                     // any session, so the 35-turn rotation and crash rebuilds
@@ -720,7 +825,7 @@ impl App {
                         &chunk_self.config.bot_id,
                         &group.group_id,
                         &model,
-                        "hy3",
+                        chunk_self.config.agy_model.as_str(),
                         crate::now_unix(),
                     )
                     .await;
@@ -734,6 +839,43 @@ impl App {
                             crate::now_unix(),
                         )
                         .await;
+                }
+            }
+        });
+
+        // Spontaneous-topic ticker (schema v1, [mem-v1-4]): once a minute,
+        // resolve pending openings from outbox/log ground truth and let
+        // silent groups roll for an opening. All gates live in the engine;
+        // the config switch is re-read from the built config each start.
+        let spot_self = Arc::clone(&self);
+        tokio::spawn(async move {
+            let speaker = Arc::new(spontaneous::PipelineSpeaker::new(
+                Arc::clone(&spot_self.store),
+                Arc::clone(&spot_self.scheduler),
+                Arc::clone(&spot_self.executor),
+                spot_self.config.bot_id.clone(),
+            ));
+            let engine = spontaneous::SpontaneousEngine::new(
+                Arc::clone(&spot_self.store),
+                Arc::clone(&spot_self.summary_model),
+                speaker,
+                Arc::clone(&spot_self.executor.running_turns),
+                spot_self.config.bot_id.clone(),
+                spot_self.config.file.spontaneous.clone(),
+                spot_self.config.file.hourly_call_budget,
+            );
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                if !spot_self.aux.healthy().await {
+                    continue;
+                }
+                let groups = spot_self
+                    .store
+                    .list_groups(&spot_self.config.bot_id)
+                    .await
+                    .unwrap_or_default();
+                for group in &groups {
+                    engine.tick_group(group, crate::now_unix()).await;
                 }
             }
         });
@@ -766,40 +908,6 @@ async fn audit_fold(
 ) {
     let action = match result {
         Ok(Some(outcome)) => {
-            // Extraction is a side branch of the fold, so it gets its own row instead of
-            // bloating the fold action string: a fold that succeeded while extraction
-            // found nothing must still look like a plain success.
-            if outcome.extracted.created > 0
-                || outcome.extracted.duplicates > 0
-                || outcome.extracted.rejected > 0
-            {
-                let extract_action =
-                    crate::memory::extract::audit_action(group_id, &outcome.extracted);
-                let _ = store
-                    .audit(
-                        crate::store::origin::audit_actor(crate::store::origin::HY3),
-                        &extract_action,
-                        Some(bot_id),
-                        Some(group_id),
-                        now,
-                    )
-                    .await;
-            } else if outcome.extracted.status
-                != Some(crate::memory::extract::CandidateParseStatus::Parsed)
-            {
-                // A reply without a usable candidate block is not worth an audit row on
-                // every cycle (the fold row already records the success), but a model
-                // that stopped emitting the block must be visible somewhere.
-                tracing::info!(
-                    group_id,
-                    status = outcome
-                        .extracted
-                        .status
-                        .map(|s| s.as_str())
-                        .unwrap_or("none"),
-                    "记忆提取跳过：候选段缺失或损坏"
-                );
-            }
             format!("memory.fold.ok.g{group_id}.n{}", outcome.folded_messages)
         }
         Ok(None) => return,
@@ -901,7 +1009,6 @@ mod tests {
             seq: 1,
             folded_messages: 200,
             summary: "摘要".into(),
-            extracted: crate::memory::extract::ExtractionReport::default(),
         };
         audit_fold(&store, "9999", "500", &Ok(Some(outcome)), 1_000).await;
         let rows = store.recent_audit(10).await.expect("审计");

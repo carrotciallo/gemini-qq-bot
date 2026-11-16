@@ -33,16 +33,9 @@ pub(super) fn screen_snapshot(screen: &Arc<Mutex<Vec<u8>>>) -> String {
 }
 
 pub(super) fn screen_tail(screen: &Arc<Mutex<Vec<u8>>>) -> String {
-    let text = screen_snapshot(screen);
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(240)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    sanitize(&tail)
+    // A bounded tail may begin halfway through a credential whose marker was
+    // already discarded. Do not persist any arbitrary terminal content.
+    sanitize(&screen_snapshot(screen))
 }
 
 pub(super) fn digest_of(screen: &str) -> String {
@@ -51,26 +44,93 @@ pub(super) fn digest_of(screen: &str) -> String {
 }
 
 pub(super) fn progress_signal(events: &[StepEvent]) -> (usize, String) {
-    let last = events
-        .last()
-        .map(|e| format!("{}:{}:{}", e.idx, e.kind, e.text.len()))
-        .unwrap_or_default();
-    (events.len(), last)
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut digest = DefaultHasher::new();
+    for event in events {
+        // Content and task/tool transitions are progress even at equal length.
+        // Timestamps and PTY repaint noise alone must not postpone the watchdog.
+        (
+            event.idx,
+            &event.kind,
+            &event.text,
+            &event.tool,
+            &event.task_id,
+            event.raw_type,
+        )
+            .hash(&mut digest);
+    }
+    (events.len(), format!("{:016x}", digest.finish()))
 }
 
 pub(super) fn sanitize(text: &str) -> String {
-    let mut out: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    out = out.split_whitespace().collect::<Vec<_>>().join("_");
-    if out.chars().count() > 80 {
-        out = out.chars().take(80).collect();
+    // This low-level process layer has no loaded secret inventory. Preserve
+    // only fixed protocol labels; arbitrary error/screen text becomes counts
+    // before either the tracing sink or retained audit queue can see it.
+    match text {
+        "color_scheme" | "tos" | "trust" | "onboard_next" => text.to_owned(),
+        _ => format!(
+            "chars{}_lines{}",
+            text.chars().count(),
+            text.lines().count()
+        ),
     }
-    if out.is_empty() {
-        out = "empty".to_string();
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn audit_redaction_resident_screen_and_error_sink_never_emit_raw_secrets() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(Arc::clone(&logged));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let audit = Arc::new(Mutex::new(Vec::new()));
+        // The credential marker is outside the old 240-char tail. Filtering
+        // only the tail would lose the marker and expose its remaining value.
+        let stdout = format!("api_key={} 中文", "FIXTURE_RAW_SECRET".repeat(30));
+        let stderr = "FIXTURE_OPAQUE_KNOWN_VALUE_123456";
+        let screen = Arc::new(Mutex::new(stdout.into_bytes()));
+        tracing::subscriber::with_default(subscriber, || {
+            push_audit(&audit, format!("resident.screen.{}", screen_tail(&screen)));
+            push_audit(&audit, format!("resident.error.{}", sanitize(stderr)));
+        });
+        let retained = audit.lock().unwrap().join("\n");
+        let trace = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+        assert!(!trace.is_empty(), "test must exercise the tracing sink");
+        for output in [&retained, &trace] {
+            assert!(
+                !output.contains("FIXTURE"),
+                "resident audit exposed raw screen/error text"
+            );
+            assert!(
+                output.contains("chars"),
+                "structural diagnostics must remain"
+            );
+        }
+        for tag in ["color_scheme", "tos", "trust", "onboard_next"] {
+            assert_eq!(
+                sanitize(tag),
+                tag,
+                "fixed onboarding event names remain stable"
+            );
+        }
     }
-    out
 }
 
 pub(super) fn push_audit(audit: &Arc<Mutex<Vec<String>>>, action: String) {

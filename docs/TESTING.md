@@ -1,4 +1,63 @@
-# 测试指南（基线 8539f0a）
+# 测试指南：当前证据与历史覆盖地图
+
+## 当前证据（2026-11-16，R22）
+
+| 验证点 | 本地全量结果 | 证据范围 |
+|---|---|---|
+| 审计基线 `93275e2` | 926 passed / 0 failed / 7 ignored | 整改前实际 `cargo test`，不是下面历史 771 的重述。 |
+| R20 `d6d7cd9` | 1022 passed / 0 failed / 7 ignored | 真实契约字段 oracle、额度边界、canary身份与进程/图像测试。 |
+| R21 `3f682e1` | 1025 passed / 0 failed / 7 ignored | 三条带数据历史迁移链及旧迁移器拒绝盲降级。 |
+
+以上来自本地执行产物，不冒称远端 CI/生产验收。嵌套子进程运行的单个
+资源回收测试不重复计入总数。后续变更以对应提交的完整日志为准，数字不是
+不随代码变化的承诺；测试只能增加，调整断言须解释等价性或变更的业务契约。
+
+### 当前命令和资源成本
+
+```bash
+cargo fmt --check
+cargo test                    # 缓存完整时也可 cargo test --offline
+cargo test populated_         # 带数据迁移链
+cargo test lifecycle_         # Linux 进程树/取消/回收
+cargo test schema_fields_match_contract
+cd web && npm test && npx tsc --noEmit
+```
+
+`--offline` 是缓存完整时的可复现选项，不是没有依赖缓存也能运行的保证。
+需要下载依赖时单独按环境网络策略准备，不在测试里访问真实模型或 QQ。
+基线前端冒烟只有 **1** 条测试，不能把它当成整个管理台端到端覆盖。
+
+- 常规 Rust 测试中有真实临时 SQLite、PTY、shell/sleep、进程组与本机
+  loopback HTTP/WebSocket。它们是离线外部服务替身，**不是纯内存/零墙钟成本**。
+- Linux 生命周期用例包括取消启动、leader 先退、TERM 不退出的后代、有限
+  kill/reap、重复重生 FD 检查及无关子进程存活。测试清理必须按所拥有 PID/PGID，
+  不可用进程名全局杀进程；没有把 Unix 证据推论为 Windows 已验收。
+- `tests/aux_smoke.rs` 的 1 条 ignored 会接真实上游；`tests/p4_replay.rs`
+  的 6 条 ignored 依赖仓库外 `/tmp/insert-lab`。默认不运行这 7 条，绝不
+  通过 `--ignored` 偷跑真实服务/消耗额度。
+- 图像测试用实际编码的 JPEG/PNG 与离线 worker：不烧生图额度；解码/字节
+  上限、状态码/响应上限、一次回退和停用后取消都有钉子。未验收仓库外浏览器
+  worker 的 DOM、登录态、节点吞吐或真实出图成功率。
+- 成功输入确认/轮末提交有本机 PTY 与 SQLite 测试，但不等同真群引用、戳一戳、
+  多段发送顺序的对话验收。K1 生产零步卡死根因、自然自发失败样本仍需只读
+  生产观测；本轮不得用真实 QQ 群测试消息填补证据缺口。
+
+### 本轮新增保障的入口
+
+- [`src/mcp/submit.rs`](../src/mcp/submit.rs)：持久化失败不 ACK、并发 seq、契约
+  字段来自实际 Serde 类型，不是 schema 与另一个手写名单互证。
+- [`src/app/turn/tests.rs`](../src/app/turn/tests.rs)：失败释放全覆盖、输入代际、
+  整轮超时、种子恢复、已确认插话权限；模拟原因码结算测试不声称完整重放触发器。
+- [`src/app/imagegen.rs`](../src/app/imagegen.rs)：归属隔离、caption过滤、原子出站、
+  中断恢复、停用门、真实图片校验和本地 worker 故障。
+- [`src/mcp/imagegen.rs`](../src/mcp/imagegen.rs)：并发额度竞争、上海日界、请求冷却
+  与日上限分别断言、主人豁免；旧“上限”测试已准确命名为冷却。
+- [`src/store/migrations.rs`](../src/store/migrations.rs)：17/22/25→27→29 合成带数据升级；
+  迁移兼容/恢复限制见 [`MIGRATION-COMPATIBILITY.md`](MIGRATION-COMPATIBILITY.md)。
+
+---
+
+# 历史快照：8539f0a（以下数字与缺口仅属于该提交）
 
 本文说明 gemini-qq-bot 的测试怎么跑、现在有多少、这次补了什么、还缺什么。
 

@@ -1,6 +1,7 @@
 //! Sticker preselection for a turn: trigger queries, diverse picks and
-//! habit picks over the group's kept shelf. Moved out of turn.rs verbatim
-//! (std-split-turn); logic unchanged.
+//! the A6 anti-repeat ranking (hard cooldown + frequency divisor) over
+//! the group's kept shelf. Moved out of turn.rs verbatim (std-split-turn);
+//! logic unchanged by the move.
 
 /// How many pre-matched library stickers one prompt may offer (A1′).
 pub(crate) const MAX_STICKER_OFFERS: usize = 3;
@@ -11,14 +12,19 @@ pub(crate) const MAX_OFFER_QUERIES: usize = 32;
 /// How much of the kept shelf one batch's preselection scans (A1′).
 pub(crate) const OFFER_SCAN_LIMIT: i64 = 500;
 
-/// How many recently sent stickers one batch looks at when damping offers (A5).
-pub(crate) const RECENT_SEND_SCAN_LIMIT: i64 = 10;
+/// How many of a group's recent sends feed the A6 anti-repeat ranking,
+/// shared by the offer preselection and `sticker_search`: the newest
+/// [`OFFER_COOLDOWN_SENDS`] hard-exclude a sticker from the menu, and the
+/// whole window feeds the frequency divisor's send counts.
+pub(crate) const RECENT_SEND_SCAN_LIMIT: i64 = 100;
 
-/// How many distinct bot rounds count as "just sent" for the habit slot (A5).
-///
-/// One round can deliver several parts, so rounds are counted by `batch_id`, not by
-/// outbox row.
-pub(crate) const RECENT_ROUND_LIMIT: usize = 3;
+/// How many of a group's most recent sends hard-exclude a sticker from
+/// the offer menu (A6). Counted in sends, not minutes, so the exclusion
+/// tracks how much of a sticker the group has actually seen: any sticker
+/// can be sent at most once per `OFFER_COOLDOWN_SENDS + 1` sends in a
+/// group, which caps a single sticker's share near 5% no matter how
+/// broadly it matches.
+pub(crate) const OFFER_COOLDOWN_SENDS: usize = 20;
 
 /// Wording that implies an emotion outranks nothing at all (A2): each hit adds
 /// its phrase list to the query set. These never select a sticker directly —
@@ -94,61 +100,53 @@ pub(crate) fn pick_diverse<'a>(
     picked
 }
 
-/// Hashes of what went out in the group's last [`RECENT_ROUND_LIMIT`] bot rounds.
+/// Rank the over-threshold rows for the offer menu (A6, 2026-11-13).
 ///
-/// `recent` arrives newest first. A round is a `batch_id`; once the third new one is
-/// seen the walk stops, so a long tail of older sends cannot leak into "just sent".
-pub(crate) fn rounds_just_sent(recent: &[(String, String, i64)]) -> Vec<String> {
-    let mut batches: Vec<&str> = Vec::new();
-    let mut hashes: Vec<String> = Vec::new();
-    for (hash, batch, _) in recent {
-        if !batches.contains(&batch.as_str()) {
-            if batches.len() == RECENT_ROUND_LIMIT {
-                break;
-            }
-            batches.push(batch.as_str());
-        }
-        if !hashes.iter().any(|seen| seen == hash) {
-            hashes.push(hash.clone());
-        }
-    }
-    hashes
-}
-
-/// Which library row the habit slot promotes this round (A5).
+/// Replaces the A5 arrangement (a flat ×0.25 damping, plus the A4 habit
+/// slot that re-offered the group's most-sent sticker every round): in
+/// group, one broadly-matching self-sticker still took 30% of
+/// two weeks' sends, because a fixed discount is eaten by a strong raw
+/// score and the habit slot kept putting the same face back on the menu.
 ///
-/// Normally the group's most-sent sticker. If that one went out within the last few
-/// rounds *and* a different over-threshold row that has not just gone out is
-/// available, that row takes the slot for this round instead. With no replacement the
-/// proven row keeps it: this is a fallback, and a fallback that can silently vanish is
-/// worse than a repeat. `None` means the slot stays unused — already picked, or the
-/// group has no send history at all.
-pub(crate) fn habit_pick(
-    ranked: &[String],
-    just_sent: &[String],
-    over_threshold: &[String],
-    taken: &[String],
-) -> Option<String> {
-    let proven = ranked.first()?;
-    if taken.iter().any(|hash| hash == proven) {
-        return None;
-    }
-    if !just_sent.iter().any(|hash| hash == proven) {
-        return Some(proven.clone());
-    }
-    for candidate in ranked.iter().skip(1) {
-        if taken.iter().any(|hash| hash == candidate) {
-            continue;
-        }
-        if just_sent.iter().any(|hash| hash == candidate) {
-            continue;
-        }
-        if !over_threshold.iter().any(|hash| hash == candidate) {
-            continue;
-        }
-        return Some(candidate.clone());
-    }
-    Some(proven.clone())
+/// Two layers now, each with one job:
+/// * the hard cooldown (hashes in `cooldown`, the group's newest
+///   [`OFFER_COOLDOWN_SENDS`] sends) keeps a just-seen sticker off the
+///   menu entirely — the share cap;
+/// * the frequency divisor ([`crate::memory::stickers::divide_by_usage`]
+///   over `counts`, sends inside the [`RECENT_SEND_SCAN_LIMIT`] window)
+///   ranks what remains, so a favourite returns gradually as its old
+///   sends age out of the window instead of snapping back at full score.
+///
+/// Only rows whose divided score still clears `OFFER_MIN_SCORE` rank.
+/// An empty result stays empty: neither cooldown nor the divisor can be
+/// bypassed to fill the menu. Ties break on hash for deterministic ordering.
+pub(crate) fn rank_offer_candidates<'a>(
+    raw: &[(f64, &'a crate::store::StickerRecord)],
+    cooldown: &[String],
+    counts: &std::collections::HashMap<String, i64>,
+) -> Vec<(f64, &'a crate::store::StickerRecord)> {
+    let cooled = |hash: &str| cooldown.iter().any(|seen| seen == hash);
+    let sort_ranked = |mut rows: Vec<(f64, &'a crate::store::StickerRecord)>| {
+        rows.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.hash.cmp(&b.1.hash))
+        });
+        rows
+    };
+    let fresh: Vec<(f64, &crate::store::StickerRecord)> = raw
+        .iter()
+        .filter(|(_, record)| !cooled(&record.hash))
+        .map(|(score, record)| {
+            let sends = counts.get(&record.hash).copied().unwrap_or(0);
+            (
+                crate::memory::stickers::divide_by_usage(*score, sends),
+                *record,
+            )
+        })
+        .filter(|(score, _)| *score >= crate::memory::stickers::OFFER_MIN_SCORE)
+        .collect();
+    sort_ranked(fresh)
 }
 
 /// One-line, length-capped summary of a quoted message's logged text.

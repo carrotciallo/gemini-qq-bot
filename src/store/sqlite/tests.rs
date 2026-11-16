@@ -110,6 +110,7 @@ async fn arm_turn_replaces_and_reports_previous() {
 #[tokio::test]
 async fn submissions_come_back_in_call_order() {
     let (_d, s) = store().await;
+    s.arm_turn("g", "tok", "batch", 1, 100).await.expect("arm");
     let seq1 = s
         .record_submission("g", "tok", "{}", "rejected", "r", 1)
         .await
@@ -118,10 +119,81 @@ async fn submissions_come_back_in_call_order() {
         .record_submission("g", "tok", "{}", "accepted", "", 2)
         .await
         .expect("记录");
-    assert_eq!((seq1, seq2), (1, 2));
+    assert_eq!((seq1, seq2), ((1, false), (2, true)));
     let rows = s.submissions_for("tok").await.expect("读提交");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1].verdict, "accepted");
+}
+
+#[tokio::test]
+async fn input_generation_rejects_delayed_old_token_in_same_second() {
+    let (_d, s) = store().await;
+    s.arm_turn("g", "old", "batch", 10, 100).await.expect("arm");
+    s.arm_turn("g", "new", "batch", 10, 100)
+        .await
+        .expect("confirmed insert");
+    // The MCP request passed its initial arm read before the insert.
+    s.record_submission("g", "old", "{}", "accepted", "", 10)
+        .await
+        .expect("record");
+    assert_eq!(
+        s.submissions_for("old").await.expect("rows")[0].verdict,
+        "rejected"
+    );
+}
+
+#[tokio::test]
+async fn input_generation_accepts_new_token_in_same_second() {
+    let (_d, s) = store().await;
+    s.arm_turn("g", "old", "batch", 10, 100).await.expect("arm");
+    s.arm_turn("g", "new", "batch", 10, 100)
+        .await
+        .expect("confirmed insert");
+    s.record_submission("g", "new", "{}", "accepted", "", 10)
+        .await
+        .expect("record");
+    assert_eq!(
+        s.submissions_for("new").await.expect("rows")[0].verdict,
+        "accepted"
+    );
+}
+
+#[tokio::test]
+async fn input_generation_cross_second_old_request_stays_invalid() {
+    let (_d, s) = store().await;
+    s.arm_turn("g", "old", "batch", 10, 100).await.expect("arm");
+    s.arm_turn("g", "new", "batch", 11, 100)
+        .await
+        .expect("confirmed insert");
+    s.record_submission("g", "old", "{}", "accepted", "", 12)
+        .await
+        .expect("old request");
+    s.record_submission("g", "new", "{}", "accepted", "", 12)
+        .await
+        .expect("new request");
+    assert_eq!(
+        s.submissions_for("old").await.expect("old rows")[0].verdict,
+        "rejected"
+    );
+    assert_eq!(
+        s.submissions_for("new").await.expect("new rows")[0].verdict,
+        "accepted"
+    );
+}
+
+#[tokio::test]
+async fn input_generation_closed_window_rejects_prechecked_request() {
+    let (_d, s) = store().await;
+    s.arm_turn("g", "old", "batch", 10, 100).await.expect("arm");
+    s.disarm_turn("g", "old").await.expect("begin insert");
+    s.record_submission("g", "old", "{}", "accepted", "", 10)
+        .await
+        .expect("record rejection");
+    assert_eq!(
+        s.submissions_for("old").await.expect("rows")[0].verdict,
+        "rejected"
+    );
+    assert!(s.armed_turn("g").await.expect("arm").is_none());
 }
 
 #[tokio::test]
@@ -552,6 +624,133 @@ async fn memories_bump_revision_and_are_group_scoped() {
 }
 
 #[tokio::test]
+async fn expire_sweep_retires_only_expired_non_panel_rows() {
+    let (_d, s) = store().await;
+    s.ensure_group("bot", "100", 0).await.expect("建群");
+    let v1 = |ttl: Option<crate::memory::schema::Ttl>| crate::memory::schema::MemoryV1Fields {
+        slot: String::new(),
+        tags: Vec::new(),
+        ttl,
+        expires_override: None,
+    };
+    // topic written at 100 expires at 100 + 48h.
+    s.insert_memory_v1(
+        "bot",
+        "100",
+        None,
+        "短命话题",
+        "topic",
+        "[]",
+        0.5,
+        crate::store::origin::HY3,
+        &v1(None),
+        100,
+    )
+    .await
+    .expect("写话题");
+    // A permanent fact never expires.
+    s.insert_memory_v1(
+        "bot",
+        "100",
+        None,
+        "长久事实",
+        "fact",
+        "[]",
+        0.5,
+        crate::store::origin::HY3,
+        &v1(None),
+        100,
+    )
+    .await
+    .expect("写事实");
+    // A panel row with an expiry is exempt from the sweep.
+    let panel_ref = s
+        .insert_memory_v1(
+            "bot",
+            "100",
+            None,
+            "面板短命行",
+            "topic",
+            "[]",
+            0.5,
+            crate::store::origin::PANEL,
+            &v1(None),
+            100,
+        )
+        .await
+        .expect("写面板行");
+    let swept = s
+        .archive_expired_memories("bot", "100", 100 + 48 * 3600)
+        .await
+        .expect("清扫");
+    assert_eq!(swept, 1);
+    let active = s.list_memories("bot", "100", 50).await.expect("读");
+    assert_eq!(active.len(), 2);
+    assert!(active.iter().any(|r| r.memory_ref == panel_ref));
+    // A second sweep at the same instant finds nothing left to do.
+    assert_eq!(
+        s.archive_expired_memories("bot", "100", 100 + 48 * 3600)
+            .await
+            .expect("再清扫"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn expire_sweep_keeps_state_consistent_with_archival() {
+    // 2026-11-12 事故：过期清扫只写 archived_at 不写 state，被清扫的行
+    // state 仍是 active，全表不变式（active ⟺ 未归档）被打破，按 state
+    // 建的墓碑清单也漏掉这些行。清扫必须与 archive_memory 同口径落
+    // state='archived'。
+    let (_d, s) = store().await;
+    s.ensure_group("bot", "100", 0).await.expect("建群");
+    let v1 = |ttl: Option<crate::memory::schema::Ttl>| crate::memory::schema::MemoryV1Fields {
+        slot: String::new(),
+        tags: Vec::new(),
+        ttl,
+        expires_override: None,
+    };
+    let short_ref = s
+        .insert_memory_v1(
+            "bot",
+            "100",
+            None,
+            "短命话题",
+            "topic",
+            "[]",
+            0.5,
+            crate::store::origin::HY3,
+            &v1(None),
+            100,
+        )
+        .await
+        .expect("写话题");
+    let swept = s
+        .archive_expired_memories("bot", "100", 100 + 48 * 3600)
+        .await
+        .expect("清扫");
+    assert_eq!(swept, 1);
+    let (state, archived_at): (String, Option<i64>) =
+        sqlx::query_as("SELECT state, archived_at FROM memories WHERE memory_ref = ?")
+            .bind(&short_ref)
+            .fetch_one(&s.pool)
+            .await
+            .expect("读行");
+    assert!(archived_at.is_some(), "清扫后必须已归档");
+    assert_eq!(
+        state, "archived",
+        "清扫后 state 必须与归档一致，不得仍是 active"
+    );
+    let violations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memories WHERE (state = 'active') != (archived_at IS NULL)",
+    )
+    .fetch_one(&s.pool)
+    .await
+    .expect("查不变式");
+    assert_eq!(violations, 0);
+}
+
+#[tokio::test]
 async fn memory_create_and_update_write_audit_rows_with_the_real_actor() {
     let (_d, s) = store().await;
     s.ensure_group("bot", "100", 1).await.expect("建组");
@@ -979,4 +1178,188 @@ async fn ambient_pace_defaults_to_normal_and_roundtrips() {
             .await
             .expect("写不存在的组")
     );
+}
+
+#[tokio::test]
+async fn quote_lookup_describes_a_tagged_picture() {
+    let (_d, s) = store().await;
+    s.ensure_group("bot", "g", 100).await.expect("建组");
+    // A picture whose logged text is only the placeholder; the tagger's
+    // description lives in image_tags. 2026-11-07: a quote pointing at such
+    // a message showed the agent a bare "[图片]", and it answered as if
+    // the picture were broken.
+    s.insert_group_message(
+        "bot",
+        "g",
+        "pic1",
+        "u",
+        Some("u"),
+        "member",
+        "[图片]",
+        true,
+        None,
+        Some("0"),
+        100,
+    )
+    .await
+    .expect("图片消息");
+    assert!(
+        s.set_message_image_tags(
+            "bot",
+            "g",
+            "pic1",
+            r#"[{"kind":"photo","description":"超级机器人大战战斗准备界面","ocr":"WAVE 1/10","emotion":"热血","text":"photo｜文字「WAVE 1/10」｜超级机器人大战战斗准备界面｜情绪热血"}]"#,
+        )
+        .await
+        .expect("回写标签")
+    );
+    let got = s
+        .group_message_text("bot", "g", "pic1")
+        .await
+        .expect("查引用")
+        .expect("命中");
+    assert!(
+        got.contains("超级机器人大战战斗准备界面"),
+        "引用摘要应带图片描述，实际: {got}"
+    );
+    // A plain text message still resolves to its own text.
+    s.insert_group_message(
+        "bot",
+        "g",
+        "t1",
+        "u",
+        Some("u"),
+        "member",
+        "上周就定好了去吃火锅",
+        false,
+        None,
+        None,
+        101,
+    )
+    .await
+    .expect("文字消息");
+    assert_eq!(
+        s.group_message_text("bot", "g", "t1")
+            .await
+            .expect("查引用")
+            .as_deref(),
+        Some("上周就定好了去吃火锅")
+    );
+    // An untagged picture keeps the placeholder — nothing better exists.
+    s.insert_group_message(
+        "bot",
+        "g",
+        "pic2",
+        "u",
+        Some("u"),
+        "member",
+        "[图片]",
+        true,
+        None,
+        Some("0"),
+        102,
+    )
+    .await
+    .expect("未打标图片");
+    assert_eq!(
+        s.group_message_text("bot", "g", "pic2")
+            .await
+            .expect("查引用")
+            .as_deref(),
+        Some("[图片]")
+    );
+}
+
+/// [seal-1] Sealed topics round-trip: add, list per group, remove. The
+/// migration runs as part of the temp-store setup, so this also proves
+/// 0027 applies cleanly on a fresh database.
+#[tokio::test]
+async fn sealed_topics_round_trip() {
+    let (_d, s) = store().await;
+    assert!(
+        s.list_sealed_topics("1", "100")
+            .await
+            .expect("读")
+            .is_empty()
+    );
+
+    let id = s
+        .add_sealed_topic(
+            "1",
+            "100",
+            &["水泥".to_string()],
+            "",
+            "112 群水泥梗封存",
+            "operator",
+            100,
+        )
+        .await
+        .expect("加封存");
+    s.add_sealed_topic("1", "200", &["别组".to_string()], "", "", "operator", 100)
+        .await
+        .expect("加别组");
+
+    let mine = s.list_sealed_topics("1", "100").await.expect("读本组");
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].id, id);
+    assert_eq!(mine[0].keywords, vec!["水泥".to_string()]);
+    assert_eq!(mine[0].note, "112 群水泥梗封存");
+
+    assert!(s.remove_sealed_topic("1", "100", id).await.expect("删"));
+    assert!(
+        s.list_sealed_topics("1", "100")
+            .await
+            .expect("读")
+            .is_empty()
+    );
+    // The other group's entry is untouched, and a second remove is a no-op.
+    assert_eq!(s.list_sealed_topics("1", "200").await.expect("读").len(), 1);
+    assert!(!s.remove_sealed_topic("1", "100", id).await.expect("再删"));
+}
+
+#[tokio::test]
+async fn running_image_jobs_are_reclaimed_to_queued() {
+    let (_d, s) = store().await;
+    let a = s
+        .insert_image_job("bot", "g", "u1", "self", "画A", false, None, 100)
+        .await
+        .expect("登记A");
+    let b = s
+        .insert_image_job("bot", "g", "u1", "self", "画B", false, None, 101)
+        .await
+        .expect("登记B");
+    let claimed = s
+        .claim_next_image_job(110)
+        .await
+        .expect("领取")
+        .expect("有活");
+    assert_eq!(claimed.id, a);
+    // B settles as failed without ever running; reclaim must not touch it.
+    s.finish_image_job(&b, "failed", None, Some("timeout"), 120)
+        .await
+        .expect("落账B");
+
+    // The executor died mid-generation: A is still `running`. Reclaim
+    // hands it back to the queue, and only it.
+    let reclaimed = s.reclaim_running_image_jobs(200).await.expect("回收");
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(reclaimed[0].id, a);
+    let job = s.get_image_job(&a).await.expect("读A").expect("有A");
+    assert_eq!(job.state, "queued");
+    let job_b = s.get_image_job(&b).await.expect("读B").expect("有B");
+    assert_eq!(job_b.state, "failed");
+
+    // Nothing running: reclaim is a no-op, and A can be claimed again.
+    assert!(
+        s.reclaim_running_image_jobs(201)
+            .await
+            .expect("再回收")
+            .is_empty()
+    );
+    let again = s
+        .claim_next_image_job(210)
+        .await
+        .expect("再领")
+        .expect("有活");
+    assert_eq!(again.id, a);
 }

@@ -74,6 +74,8 @@ pub struct ResidentManager {
     model: String,
     reader: Arc<dyn StepReader>,
     sessions: tokio::sync::Mutex<HashMap<String, Arc<ResidentSession>>>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    lifecycle: tokio::sync::RwLock<()>,
     /// Spawns that have not finished onboarding. `sessions` stays empty until
     /// `wait_ready` returns, and the flush loop ticks every 500ms, so without
     /// this map a restart births one PTY per tick per group.
@@ -204,6 +206,8 @@ impl ResidentManager {
             model,
             reader: Arc::new(DbStepReader),
             sessions: tokio::sync::Mutex::new(HashMap::new()),
+            shutdown: tokio::sync::watch::channel(false).0,
+            lifecycle: tokio::sync::RwLock::new(()),
             inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             paused_since: tokio::sync::Mutex::new(HashMap::new()),
             probes: tokio::sync::Mutex::new(HashMap::new()),
@@ -413,6 +417,24 @@ impl ResidentManager {
         workspace: &Path,
         conversation_id: Option<String>,
     ) -> Result<Arc<ResidentSession>, ResidentError> {
+        let mut shutdown = self.shutdown.subscribe();
+        let _lease = self.lifecycle.read().await;
+        if *shutdown.borrow() {
+            return Err(ResidentError::Blocked("manager shutting down".into()));
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => Err(ResidentError::Blocked("manager shutting down".into())),
+            result = self.session_open(group_id, workspace, conversation_id) => result,
+        }
+    }
+
+    async fn session_open(
+        &self,
+        group_id: &str,
+        workspace: &Path,
+        conversation_id: Option<String>,
+    ) -> Result<Arc<ResidentSession>, ResidentError> {
         if let Some(live) = self.live_session(group_id).await {
             return Ok(live);
         }
@@ -594,6 +616,49 @@ impl ResidentManager {
         }
     }
 
+    /// Forget the per-group caches that describe one group's conversation.
+    ///
+    /// Called after the group's session is closed, when the bot leaves the
+    /// group: probe window, canary day, delivery strikes, replay marks and
+    /// refusal counts are all statements about a conversation that no longer
+    /// exists, so keeping them only makes memory grow with the historical
+    /// group list.
+    ///
+    /// The respawn ladder is deliberately NOT cleared: it is the only entry
+    /// here whose whole purpose is to outlive a session, and resetting it on a
+    /// leave/rejoin would remove exactly the protection against the respawn
+    /// storm it was built for. Ordinary rotation never calls this at all.
+    pub async fn forget_group(&self, group_id: &str) {
+        self.probes.lock().await.remove(group_id);
+        self.canary_day.lock().await.remove(group_id);
+        self.deliver_strikes.lock().await.remove(group_id);
+        self.retry_marks.lock().await.remove(group_id);
+        self.prompt_rejections.lock().await.clear(group_id);
+    }
+
+    /// True when this group has a stored backoff deadline. Only for tests and
+    /// the panel; production reads it through [`Self::backoff_active`].
+    pub async fn has_backoff(&self, group_id: &str) -> bool {
+        self.respawn_backoff.lock().await.contains_key(group_id)
+    }
+
+    /// Number of per-group rows this manager holds for a conversation.
+    ///
+    /// The respawn ladder is excluded on purpose: it is the one table that
+    /// must survive a session and a leave/rejoin (see [`Self::forget_group`]),
+    /// so counting it here would make the lifecycle test demand the bug back.
+    /// Only for tests — one number instead of eight private maps.
+    #[cfg(test)]
+    pub async fn transient_group_rows(&self) -> usize {
+        self.sessions.lock().await.len()
+            + self.paused_since.lock().await.len()
+            + self.probes.lock().await.len()
+            + self.canary_day.lock().await.len()
+            + self.deliver_strikes.lock().await.len()
+            + self.retry_marks.lock().await.len()
+            + self.prompt_rejections.lock().await.len()
+    }
+
     /// Close one group's session, if any.
     pub async fn close(&self, group_id: &str) {
         self.close_as(group_id, group_id).await;
@@ -605,11 +670,23 @@ impl ResidentManager {
     /// its `resident.session.*` lines must land on the group an operator reads
     /// rather than on a `"<group>#canary"` id that no group row backs.
     pub async fn close_as(&self, key: &str, group_id: &str) {
+        self.close_mode(key, group_id, false).await;
+    }
+
+    pub(crate) async fn abort(&self, group_id: &str) {
+        self.close_mode(group_id, group_id, true).await;
+    }
+
+    async fn close_mode(&self, key: &str, group_id: &str, immediate: bool) {
         let mut sessions = self.sessions.lock().await;
         let removed = sessions.remove(key);
         drop(sessions);
         if let Some(session) = removed {
-            session.close().await;
+            if immediate {
+                session.abort().await;
+            } else {
+                session.close().await;
+            }
             for action in session.drain_audit() {
                 self.audit(group_id, &action).await;
             }
@@ -619,6 +696,10 @@ impl ResidentManager {
 
     /// Close every session. Used on shutdown only.
     pub async fn close_all(&self) {
+        // Wake/cancel onboarding and followers before waiting for their leases.
+        // No session can be published after this exclusive barrier is acquired.
+        self.shutdown.send_replace(true);
+        let _exclusive = self.lifecycle.write().await;
         let drained: Vec<(String, Arc<ResidentSession>)> = {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect()
@@ -727,6 +808,53 @@ mod tests {
         assert_eq!(manager.deliver_timeout_s, 30);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn lifecycle_close_all_cancels_spawn_and_rejects_late_sessions() {
+        use crate::process::test_support::*;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("agy");
+        let pid_path = dir.path().join("leader.pid");
+        executable(
+            &bin,
+            &format!(
+                "#!/bin/sh\ntrap '' HUP TERM\necho $$ > {}\nsleep 1\nprintf '? for shortcuts\\n'\nexec sleep 60\n",
+                pid_path.display()
+            ),
+        );
+        let pool = crate::store::migrations::open_temp(dir.path())
+            .await
+            .unwrap();
+        let manager = Arc::new(ResidentManager::new(
+            Arc::new(SqliteStore::new(pool)),
+            "bot".into(),
+            bin,
+            dir.path().to_path_buf(),
+            "model".into(),
+        ));
+        let work = dir.path().join("ws");
+        std::fs::create_dir_all(&work).unwrap();
+        let task_manager = Arc::clone(&manager);
+        let task_work = work.clone();
+        let task = tokio::spawn(async move { task_manager.session("g1", &task_work, None).await });
+        let pid = pid_file(&pid_path).await;
+        manager.close_all().await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let late_count = manager.live_count().await;
+        // Clean the old implementation's late insertion before asserting.
+        if let Ok(session) = &result {
+            session.close().await;
+        }
+        cleanup(pid);
+        assert!(result.is_err(), "onboarding published after close_all");
+        assert_eq!(late_count, 0);
+        assert!(!manager.spawn_in_flight("g1"));
+        assert!(manager.session("g2", &work, None).await.is_err());
+    }
+
     // The fake agy is a #!/bin/sh script: unix-only by construction.
     #[cfg(unix)]
     #[tokio::test]
@@ -797,6 +925,9 @@ mod tests {
             .await
             .expect("real");
         let real_pid = real.pid().await.expect("pid");
+        let real_db = real.db_path().await;
+        let real_state = real.state().await;
+        assert!(real_state.is_ready());
 
         // The canary asks for a scratch key with no conversation. It must fork its
         // own process rather than reuse the group's.
@@ -818,6 +949,17 @@ mod tests {
         assert_eq!(manager.live_count().await, 1);
         assert_eq!(real.pid().await, Some(real_pid));
         assert_eq!(real.conversation_id().await.as_deref(), Some("conv-g1"));
+        assert_eq!(real.db_path().await, real_db);
+        assert_eq!(real.state().await, real_state);
+        let same = manager.session("g1", &workspace, None).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&real, &same),
+            "not merely a replacement with the same metadata"
+        );
+        assert!(matches!(
+            scratch.state().await,
+            crate::agent::resident::SessionState::Dead(_)
+        ));
 
         // The sweep ignores scratch keys, so a live one is never looked up as a
         // group (no `groups` row could exist) and never reclaimed.
@@ -826,11 +968,14 @@ mod tests {
             .await
             .expect("scratch");
         assert!(
-            scratch.state().await != crate::agent::resident::SessionState::Dead(String::new()),
-            "scratch session should be live before the sweep"
+            scratch.state().await.is_ready(),
+            "scratch must actually be ready"
         );
         manager.sweep(crate::now_unix()).await;
         assert_eq!(manager.live_count().await, 2);
+        assert!(scratch.state().await.is_ready());
+        assert_eq!(real.state().await, real_state);
+        assert_eq!(real.db_path().await, real_db);
 
         manager.close(&key).await;
         manager.close("g1").await;

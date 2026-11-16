@@ -157,12 +157,58 @@ pub struct MemoryRecord {
     pub archived_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Schema v1 predicate label (`高达模型取向`); empty when the writer gave none.
+    #[serde(default)]
+    pub slot: String,
+    /// Schema v1 clustering labels; empty when the writer gave none.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Schema v1 expiry (epoch seconds); `None` is permanent. An expired row is
+    /// retired by the expire sweep and never surfaces in retrieval meanwhile.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// Lifecycle state (migration 0026): `active`, `superseded`, `retired`,
+    /// `expired` or `archived`. Structured data — never inferred from content.
+    /// Invariant: `active` exactly when `archived_at` is `None`.
+    #[serde(default = "default_memory_state")]
+    pub state: String,
+    /// The row that replaced this one, when `state` is `superseded`.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// When `state` last changed (epoch seconds).
+    #[serde(default)]
+    pub state_changed_at: Option<i64>,
+}
+
+fn default_memory_state() -> String {
+    "active".to_string()
+}
+
+/// One operator-declared dead topic for a group (migration 0027, [seal-1]).
+///
+/// A sealed topic must not re-enter the group's derived context. An entry
+/// hits when its `slot` equals the candidate's slot (only when the entry
+/// names one) OR any of its `keywords` appears in the candidate text.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SealedTopic {
+    pub id: i64,
+    pub bot_id: String,
+    pub group_id: String,
+    pub keywords: Vec<String>,
+    pub slot: String,
+    pub note: String,
+    pub created_at: i64,
 }
 
 impl MemoryRecord {
     /// True when the row is retired and must not surface or be written again.
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// True when the row's v1 expiry has passed at `now`.
+    pub fn is_expired(&self, now: i64) -> bool {
+        matches!(self.expires_at, Some(at) if at <= now)
     }
 }
 
@@ -310,6 +356,8 @@ impl JobState {
 pub enum ActorKind {
     Owner,
     Panel,
+    /// A background loop acting on its own schedule (auto compaction).
+    System,
 }
 
 impl ActorKind {
@@ -317,6 +365,7 @@ impl ActorKind {
         match self {
             ActorKind::Owner => "owner",
             ActorKind::Panel => "panel",
+            ActorKind::System => "system",
         }
     }
 }
@@ -369,6 +418,22 @@ pub struct AgentCall {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub error_class: Option<String>,
+}
+
+/// The step counters a finished resident round writes onto its call row.
+///
+/// `session_events` is the whole step stream of the resident session (the same
+/// number migration 0012's `steps_count` has always held); `turn_delta` is how
+/// many of those steps belong to the round that just finished. They are
+/// different numbers on purpose — a resident call spans many batches, so the
+/// cumulative count is not this round's size (K2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResidentCounts {
+    pub session_events: i64,
+    pub turn_delta: i64,
+    pub last_progress_idx: i64,
+    pub insert_count: i64,
+    pub draft_count: i64,
 }
 
 /// Per-group seed quarantine state (migration 0020). `last_seed_hash` is the
@@ -454,7 +519,9 @@ pub struct OutboxRecord {
     pub group_id: String,
     pub batch_id: String,
     pub text: String,
-    /// `text` or `sticker`. A sticker row keeps its bytes out of the database.
+    /// `text`, `sticker` or `image`. A sticker row keeps its bytes out of the
+    /// database; an `image` row does the same, with `text` holding the bare
+    /// file name under the imagegen output directory.
     pub kind: String,
     /// Content hash when `kind == "sticker"`; the bytes live at
     /// `<sticker_dir>/<hash>.jpg`.
@@ -481,8 +548,64 @@ pub struct OutboxPart<'a> {
     pub now: i64,
     /// Content hash when this part is a sticker instead of text.
     pub sticker_hash: Option<&'a str>,
+    /// Generated-picture file name when this part is a plain image instead of
+    /// text. The name is stored in the row's `text` column (the locator, like
+    /// a sticker's hash) and resolved against the imagegen output directory
+    /// at delivery time; it must be a bare file name, never a path.
+    pub image_file: Option<&'a str>,
     /// OneBot message id this part quotes; see [`OutboxRecord::quote_message_id`].
     pub quote_message_id: Option<&'a str>,
+}
+
+/// One registered picture request (migration 0025). A job counts against
+/// its bucket's daily cap from the moment it exists, whatever state it ends
+/// in; the panel reset watermark is the only way to give quota back early.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageJob {
+    pub id: String,
+    pub bot_id: String,
+    pub group_id: String,
+    /// QQ id the picture is charged to, or `bot` for the self bucket.
+    pub requester_id: String,
+    /// `self` (she decided to draw) or `request` (a member explicitly asked).
+    pub bucket: String,
+    pub prompt: String,
+    pub self_portrait: bool,
+    pub caption: Option<String>,
+    /// queued | running | succeeded | failed
+    pub state: String,
+    pub file_path: Option<String>,
+    pub error_class: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The panel-editable image generation limits (single row, migration 0025).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImagegenSettings {
+    pub self_daily_cap: i64,
+    pub request_daily_cap: i64,
+    pub request_cooldown_minutes: i64,
+    pub updated_at: i64,
+}
+
+impl Default for ImagegenSettings {
+    fn default() -> Self {
+        Self {
+            self_daily_cap: 15,
+            request_daily_cap: 5,
+            request_cooldown_minutes: 10,
+            updated_at: 0,
+        }
+    }
+}
+
+/// Start of the current day in Asia/Shanghai (fixed UTC+8, no DST), as a
+/// unix epoch. The imagegen buckets count by this day; compaction's UTC day
+/// is a legacy exception, not a model to copy.
+pub fn shanghai_day_start(now: i64) -> i64 {
+    const OFFSET: i64 = 8 * 3600;
+    ((now + OFFSET).div_euclid(86_400) * 86_400) - OFFSET
 }
 
 /// A low-cardinality audit entry. Only `owner` / `panel` actors are recorded.
@@ -624,6 +747,12 @@ mod tests {
             archived_at: None,
             created_at: 10,
             updated_at: 10,
+            slot: String::new(),
+            tags: Vec::new(),
+            expires_at: None,
+            state: "active".to_string(),
+            superseded_by: None,
+            state_changed_at: None,
         };
         assert!(!memory.is_archived());
         memory.archived_at = Some(0);

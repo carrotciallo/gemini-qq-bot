@@ -85,12 +85,7 @@ impl DownloadedImage {
 /// Validate a URL against the allowlist and the forbidden-range rules.
 ///
 /// DNS resolution happens on a blocking thread because `ToSocketAddrs` is synchronous.
-pub async fn check_url(
-    raw: &str,
-    origins: &[String],
-    max_bytes: u64,
-) -> Result<url::Url, MediaError> {
-    let _ = max_bytes;
+pub async fn check_url(raw: &str, origins: &[String]) -> Result<url::Url, MediaError> {
     let parsed = url::Url::parse(raw).map_err(|_| MediaError::BadUrl)?;
     match parsed.scheme() {
         "http" | "https" => {}
@@ -164,19 +159,24 @@ pub struct HttpFetcher {
 }
 
 impl HttpFetcher {
-    pub fn new(origins: Vec<String>, max_bytes: u64) -> Self {
+    /// Build the real fetcher.
+    ///
+    /// Construction failure is returned, never absorbed: falling back to a default
+    /// `reqwest::Client` would silently drop the no-redirect policy and both
+    /// timeouts, i.e. exactly the defences this module exists to keep.
+    pub fn new(origins: Vec<String>, max_bytes: u64) -> crate::error::BotResult<Self> {
         let client = reqwest::Client::builder()
             // A redirect can leave the allowlist, so none is followed.
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TOTAL_TIMEOUT)
             .build()
-            .unwrap_or_default();
-        Self {
+            .map_err(|err| crate::error::BotError::Message(format!("media http client: {err}")))?;
+        Ok(Self {
             client,
             origins,
             max_bytes,
-        }
+        })
     }
 
     pub fn origins(&self) -> &[String] {
@@ -192,7 +192,7 @@ impl ImageFetcher for HttpFetcher {
         } else {
             max_bytes
         };
-        let parsed = check_url(url, &self.origins, limit).await?;
+        let parsed = check_url(url, &self.origins).await?;
 
         let response = self
             .client
@@ -268,7 +268,7 @@ mod tests {
         // A public literal IP passes the screen without any DNS traffic.
         let origins = vec!["https://93.184.216.34".to_string()];
         assert!(
-            check_url("https://93.184.216.34/x.png", &origins, 1024)
+            check_url("https://93.184.216.34/x.png", &origins)
                 .await
                 .is_ok()
         );
@@ -283,7 +283,7 @@ mod tests {
             "https://media.example.com:8443/x.png", // port differs
         ] {
             assert_eq!(
-                check_url(bad, &origins(), 1024).await.err(),
+                check_url(bad, &origins()).await.err(),
                 Some(MediaError::OriginNotAllowed),
                 "{bad} 必须被拒绝"
             );
@@ -296,7 +296,7 @@ mod tests {
             let origin = format!("https://{host}");
             let url = format!("https://{host}/x.png");
             assert_eq!(
-                check_url(&url, &[origin], 1024).await.err(),
+                check_url(&url, &[origin]).await.err(),
                 Some(MediaError::ForbiddenHost),
                 "{host} 必须被拒绝"
             );
@@ -308,12 +308,10 @@ mod tests {
         for host in ["10.0.0.5", "192.168.1.10", "172.16.0.1", "[fc00::1]"] {
             let origin = format!("https://{host}");
             let url = format!("https://{host}/x.png");
-            assert!(check_url(&url, &[origin], 1024).await.is_ok(), "{host}");
+            assert!(check_url(&url, &[origin]).await.is_ok(), "{host}");
         }
         assert_eq!(
-            check_url("https://10.0.0.5/x.png", &origins(), 1024)
-                .await
-                .err(),
+            check_url("https://10.0.0.5/x.png", &origins()).await.err(),
             Some(MediaError::OriginNotAllowed)
         );
     }
@@ -322,7 +320,7 @@ mod tests {
     async fn credentials_in_url_are_refused() {
         let origin = vec!["https://media.example.com".to_string()];
         assert_eq!(
-            check_url("https://user:pw@media.example.com/x.png", &origin, 1024)
+            check_url("https://user:pw@media.example.com/x.png", &origin)
                 .await
                 .err(),
             Some(MediaError::BadUrl)
@@ -333,7 +331,7 @@ mod tests {
     async fn non_http_schemes_are_refused() {
         for bad in ["file:///etc/passwd", "ftp://media.example.com/x.png"] {
             assert_eq!(
-                check_url(bad, &origins(), 1024).await.err(),
+                check_url(bad, &origins()).await.err(),
                 Some(MediaError::BadScheme),
                 "{bad} 必须被拒绝"
             );
@@ -344,7 +342,7 @@ mod tests {
     fn fetcher_disables_redirects() {
         // Constructing the client must not panic and must keep the policy in place; the
         // observable behaviour is covered by the Location-header refusal above.
-        let fetcher = HttpFetcher::new(origins(), 1024);
+        let fetcher = HttpFetcher::new(origins(), 1024).expect("客户端构造应当成功");
         assert_eq!(fetcher.origins().len(), 1);
     }
 }

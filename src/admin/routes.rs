@@ -120,6 +120,7 @@ fn shared_routes() -> Router<Arc<AdminState>> {
         .route("/outbox/{id}/retry", post(retry_outbox))
         .route("/pending", get(pending_overview))
         .route("/audit", get(audit_log))
+        .merge(imagegen::routes())
 }
 
 /// The public mount: everything shared, plus the settings routes, which
@@ -385,10 +386,14 @@ pub fn route_paths() -> Vec<&'static str> {
         "/internal/v1/outbox/{id}/retry",
         "/internal/v1/pending",
         "/internal/v1/audit",
+        "/internal/v1/imagegen/settings",
+        "/internal/v1/groups/{group_id}/imagegen/usage",
+        "/internal/v1/groups/{group_id}/imagegen/reset",
     ]
 }
 
 mod groups;
+mod imagegen;
 mod memories;
 mod ops;
 mod settings;

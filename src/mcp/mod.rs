@@ -8,10 +8,12 @@
 //! * [`memory`] — read-only `memory_search` over reviewed facts, folded windows, and the unarchived log.
 //! * [`stickers`] — `sticker_search` over her library plus `sticker_keep`.
 //! * [`submit`] — `submit_reply`, the structured channel a turn's final output is delivered through.
+//! * [`imagegen`] — `generate_image`, registering a picture for the background executor under a two-bucket daily quota.
 //!
 //! Both are scoped by the workspace `scope.json` handed over via MCP roots, never by a
 //! tool argument: a model that could pass a group id could read another group.
 
+pub mod imagegen;
 pub mod memory;
 pub mod session;
 pub mod stickers;

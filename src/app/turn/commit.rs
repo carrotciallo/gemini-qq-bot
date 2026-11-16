@@ -42,24 +42,27 @@ impl TurnExecutor {
     /// Commit a resident turn: a turn is finished once, by the resident path, with
     /// the coverage window that lists every batch delivered into it.
     ///
-    /// `coverage` is `TurnCoverage` for an unattended single-batch turn (the batch's
-    /// own messages are the window) and `ResidentCoverage` for a resident turn, where
-    /// several batches were delivered into one turn: every one of them has to be
-    /// covered by the freshness gate, the oldest first, or the reply is dropped as
+    /// `coverage` lists every batch this resident turn delivered: all of them have to
+    /// be covered by the freshness gate, the oldest first, or the reply is dropped as
     /// stale.
-    pub(super) async fn finish_turn_with_coverage<C: FreshnessCoverage>(
+    pub(super) async fn finish_turn_with_coverage(
         &self,
         job: &BatchJob,
         call_id: &str,
         contract_json: &str,
         timing: TurnTiming,
         prepared: PreparedTurn,
-        coverage: C,
+        coverage: ResidentCoverage,
     ) -> Result<TurnResult, TurnResult> {
         let TurnTiming {
             turn_started,
             agent_started,
         } = timing;
+        let deadline = turn_started
+            + std::time::Duration::from_secs(self.resident_limits.hard_cap_s.max(1) as u64);
+        if std::time::Instant::now() >= deadline {
+            return Err(TurnResult::AgentFailed);
+        }
         let PreparedTurn {
             messages,
             members,
@@ -74,9 +77,14 @@ impl TurnExecutor {
         } = prepared;
         // The rows this turn consumes if it succeeds. A turn covers every batch it
         // delivered, so the gate and the final delete work off the union rather than
-        // off the first batch.
-        let covered = coverage.event_ids(job);
-        let coverage_label = coverage.label();
+        // off the first batch. An empty window falls back to the job's own rows: the
+        // turn was never handed a batch, so the claimed batch is all it speaks for.
+        let covered = if coverage.batches.is_empty() {
+            job.event_ids.clone()
+        } else {
+            coverage.event_ids()
+        };
+        let coverage_label = "resident";
         // 6. Validate the contract.
         // Step timing for the post-agent paths (the execution black box the
         // latency study flagged): prepare = everything before the agent call
@@ -257,6 +265,7 @@ impl TurnExecutor {
                     group_id = %job.group_id,
                     added = summary.added,
                     updated = summary.updated,
+                    retired = summary.retired,
                     out_of_scope = summary.out_of_scope,
                     archived = summary.archived,
                     failed = summary.failed,
@@ -907,6 +916,9 @@ impl TurnExecutor {
             final_quote_ids.iter().map(|q| q.as_deref()).collect()
         };
 
+        if std::time::Instant::now() >= deadline {
+            return Err(TurnResult::AgentFailed);
+        }
         let ids = match self
             .outbox
             .enqueue_mixed(
@@ -975,6 +987,9 @@ impl TurnExecutor {
         // accepted the turn, so a reply that never made it out never pokes anyone.
         // Fire-and-forget — a failed poke is an audit row, never a reason to
         // unwind a reply the group already has coming.
+        if std::time::Instant::now() >= deadline {
+            return Err(TurnResult::AgentFailed);
+        }
         if let Some(ref target) = validated.output.poke_ref {
             self.send_poke(&messages, target, &job.group_id).await;
         }
@@ -1006,7 +1021,7 @@ impl TurnExecutor {
         // 9. Deliver one part at a time. A later failure seals the rest.
         let gaps = crate::agent::segments::message_gaps_ms(&parts);
         let send_started = std::time::Instant::now();
-        self.deliver_parts(&ids, &gaps, &job.group_id, &job.batch_id)
+        self.deliver_parts(&ids, &gaps, &job.group_id, &job.batch_id, deadline)
             .await;
         // The next turn's annex lists the batch she answered but not her
         // answer; without it she cannot tell a correction of that answer

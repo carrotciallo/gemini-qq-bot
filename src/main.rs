@@ -74,6 +74,107 @@ async fn health_probe() -> ExitCode {
     }
 }
 
+/// One-shot migration of pre-v1 memory rows (`--migrate-memories-v1`).
+///
+/// Usage: `gemini-qq-bot --migrate-memories-v1 --db <path> [--out <report.json>] [--apply]`
+///
+/// Dry-run unless `--apply` is given. The production database path is refused
+/// in code (see `memory::migrate_v1::PRODUCTION_DB_PATHS`): the intended target
+/// is always a copy, and `--apply` first writes a timestamped backup beside it.
+/// The aux gateway is configured from the same environment as the bot
+/// (`AUX_BASE_URL`, `AUX_MODEL`, `AUX_API_KEY_FILE`).
+async fn migrate_memories_v1() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    let arg_value = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let Some(db_path) = arg_value("--db") else {
+        eprintln!("--migrate-memories-v1 需要 --db <数据库路径>");
+        return ExitCode::from(2);
+    };
+    let db_path = std::path::PathBuf::from(db_path);
+    if gemini_qq_bot::memory::migrate_v1::is_production_path(&db_path) {
+        eprintln!("拒绝在生产库路径上运行迁移工具: {}", db_path.display());
+        return ExitCode::from(2);
+    }
+    let apply = args.iter().any(|a| a == "--apply");
+    let out_path = arg_value("--out")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("memories-v1-report.json"));
+
+    let pool = match gemini_qq_bot::store::migrations::open_and_migrate(&db_path).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("打开数据库失败: {e}");
+            return ExitCode::from(3);
+        }
+    };
+    let store = SqliteStore::new(pool);
+
+    let key_file = std::env::var("AUX_API_KEY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/data/secrets/workbuddy_api_key"));
+    let mut gateway_config = gemini_qq_bot::integrations::aux_gateway::AuxGatewayConfig::new(
+        std::env::var("AUX_BASE_URL").ok(),
+        std::env::var("AUX_MODEL").ok(),
+        key_file,
+        true,
+    );
+    // Same env contract as the bot: production names the sticky-session
+    // header `X-Workbuddy-Session` via AUX_SESSION_HEADER.
+    if let Ok(header) = std::env::var("AUX_SESSION_HEADER") {
+        if !header.trim().is_empty() {
+            gateway_config.session_header = header;
+        }
+    }
+    let model = gemini_qq_bot::integrations::aux_gateway::AuxGatewayClient::new(gateway_config);
+
+    let now = gemini_qq_bot::now_unix();
+    let mut backup_path = None;
+    if apply {
+        let backup = gemini_qq_bot::memory::migrate_v1::backup_path_for(&db_path, now);
+        match std::fs::copy(&db_path, &backup) {
+            Ok(_) => backup_path = Some(backup.display().to_string()),
+            Err(e) => {
+                eprintln!("写备份失败，拒绝 apply: {e}");
+                return ExitCode::from(3);
+            }
+        }
+    }
+    let mut report =
+        gemini_qq_bot::memory::migrate_v1::run_migration(&store, &model, apply, now).await;
+    report.backup_path = backup_path;
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&out_path, &json) {
+                eprintln!("写报告失败: {e}");
+                return ExitCode::from(3);
+            }
+            println!(
+                "迁移{}完成: 候选 {}、已转 {}、失败 {}、预计首轮淘汰 {}；报告 {}",
+                if apply {
+                    "（已回写）"
+                } else {
+                    "（dry-run）"
+                },
+                report.candidates,
+                report.converted,
+                report.failed.len(),
+                report.would_expire,
+                out_path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("序列化报告失败: {e}");
+            ExitCode::from(3)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--health-probe") {
@@ -81,6 +182,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "--mcp-memory") {
         return serve_memory_mcp().await;
+    }
+    if std::env::args().any(|a| a == "--migrate-memories-v1") {
+        return migrate_memories_v1().await;
     }
 
     tracing_subscriber::fmt()

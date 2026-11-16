@@ -36,6 +36,7 @@ fn batch() -> PromptBatch {
         annex: None,
         flooded: false,
         flood_background: None,
+        spontaneous: None,
         turn_token: None,
         now_line: None,
     }
@@ -58,13 +59,61 @@ fn mcp_agents_md_swaps_only_the_delivery_framing() {
     let mcp = agents_md_for(crate::config::OutputChannel::Mcp);
     assert!(mcp.contains("submit_reply"));
     assert!(mcp.contains("turn_token"));
-    assert!(mcp.contains("这四个以外的 MCP 工具"));
+    assert!(mcp.contains("这五个以外的 MCP 工具"));
     assert!(!mcp.contains("只输出一个 JSON 对象"));
     // The shared rules survive the derivation untouched.
     assert!(mcp.contains("不可信数据"));
     let text = agents_md();
     assert!(text.contains("只输出一个 JSON 对象"));
     assert!(!text.contains("turn_token"));
+}
+
+/// [opt-2] The memory discipline card must tell the bot, in both output
+/// channels: your nicknames are you (never file yourself as two people),
+/// and 主人 names exactly one person — another AI's operator is not him.
+#[test]
+fn memory_card_names_the_bot_itself_and_the_single_owner() {
+    for card in [
+        agents_md(),
+        agents_md_for(crate::config::OutputChannel::Mcp),
+    ] {
+        assert!(card.contains("不许把自己记成两个人"), "got: {card}");
+        assert!(
+            card.contains("「主人」只指 role 为 owner 的那个人"),
+            "got: {card}"
+        );
+        assert!(card.contains("那不是你的主人"), "got: {card}");
+    }
+}
+
+/// [opt-4] The memory card must carry the attribution discipline the
+/// 2026-11-12 audit found missing: jokes and banter do not establish
+/// whose fact something is, and the bot's own earlier words are not
+/// evidence (she once misattributed a fact in jest, a member played
+/// along, and the fold wrote the joke down as fact).
+#[test]
+fn memory_card_distrusts_joke_attribution() {
+    let card = agents_md();
+    assert!(card.contains("归属只认当事人自己的发言"), "got: {card}");
+    assert!(card.contains("你自己说过的话更不算证据"), "got: {card}");
+}
+
+/// [img-aware] Both channels' cards must state drawing as her own
+/// capability. The generate_image tool sat in tools/list from the
+/// start, but nothing in her standing instructions said she can draw,
+/// so she answered like a text-only AI when asked (2026-11-12).
+#[test]
+fn card_states_drawing_as_her_own_capability() {
+    for card in [
+        agents_md(),
+        agents_md_for(crate::config::OutputChannel::Mcp),
+    ] {
+        assert!(card.contains("画图是你的真本事"), "got: {card}");
+        assert!(
+            card.contains("不要拿「文字 AI 不能画图」之类的套路回绝"),
+            "got: {card}"
+        );
+    }
 }
 
 #[test]
@@ -237,8 +286,14 @@ fn nonempty_memory_points_at_search() {
         entries: vec![ContextMemory {
             memory_ref: "mem_a".into(),
             subject_ref: None,
+            subject: crate::memory::schema::SubjectV1 {
+                subject_type: "group".into(),
+                alias: "group".into(),
+            },
             content: "喜欢咖啡".into(),
             kind: "fact".into(),
+            slot: String::new(),
+            tags: Vec::new(),
             score: 1.0,
             recent: false,
         }],
@@ -257,8 +312,14 @@ fn a_digest_replaces_the_raw_list_in_the_same_section() {
         entries: vec![ContextMemory {
             memory_ref: "mem_a".into(),
             subject_ref: None,
+            subject: crate::memory::schema::SubjectV1 {
+                subject_type: "group".into(),
+                alias: "group".into(),
+            },
             content: "喜欢咖啡".into(),
             kind: "fact".into(),
+            slot: String::new(),
+            tags: Vec::new(),
             score: 1.0,
             recent: false,
         }],

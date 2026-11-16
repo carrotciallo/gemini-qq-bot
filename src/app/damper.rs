@@ -521,6 +521,18 @@ impl Damper {
             .and_then(|groups| groups.get(group_id).and_then(|state| state.hint.clone()))
     }
 
+    /// Drop everything remembered about one group.
+    ///
+    /// Called when the bot leaves a group: the window, the tier and the
+    /// announced caps describe a conversation that no longer exists, and a
+    /// rejoin must start from a neutral L0 rather than inherit the tail of an
+    /// old episode.
+    pub fn forget(&self, group_id: &str) {
+        if let Ok(mut groups) = self.groups.lock() {
+            groups.remove(group_id);
+        }
+    }
+
     /// Current level, for tests and the audit trail.
     pub fn tier(&self, group_id: &str) -> Tier {
         self.groups

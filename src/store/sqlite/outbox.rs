@@ -4,6 +4,26 @@
 use super::*;
 
 impl SqliteStore {
+    /// First confirmed delivery of this exact batch, not its enqueue time.
+    pub async fn first_batch_sent_at(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        batch_id: &str,
+        now: i64,
+    ) -> BotResult<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MIN(updated_at) FROM outbox
+             WHERE bot_id=? AND group_id=? AND batch_id=? AND state='sent' AND updated_at<=?",
+        )
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(batch_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn enqueue_outbox(
         &self,
         bot_id: &str,
@@ -33,12 +53,40 @@ impl SqliteStore {
         &self,
         part: crate::store::OutboxPart<'_>,
     ) -> BotResult<String> {
+        let mut tx = self.pool.begin().await?;
+        let id = Self::insert_outbox_part(&mut tx, &part).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn enqueue_outbox_parts(
+        &self,
+        parts: &[crate::store::OutboxPart<'_>],
+    ) -> BotResult<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let mut ids = Vec::with_capacity(parts.len());
+        for part in parts {
+            ids.push(Self::insert_outbox_part(&mut tx, part).await?);
+        }
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    pub(super) async fn insert_outbox_part(
+        connection: &mut sqlx::SqliteConnection,
+        part: &crate::store::OutboxPart<'_>,
+    ) -> BotResult<String> {
         let id = format!("out_{}", uuid_like());
-        let kind = if part.sticker_hash.is_some() {
+        let kind = if part.image_file.is_some() {
+            "image"
+        } else if part.sticker_hash.is_some() {
             "sticker"
         } else {
             "text"
         };
+        // An image part's locator is its bare file name, stored in `text`
+        // the way a sticker's hash identifies its bytes.
+        let text = part.image_file.unwrap_or(part.text);
         sqlx::query(
             "INSERT INTO outbox
                 (id, bot_id, group_id, batch_id, text, kind, sticker_hash, quote_message_id, state, part_index, part_count, created_at, updated_at)
@@ -48,7 +96,7 @@ impl SqliteStore {
         .bind(part.bot_id)
         .bind(part.group_id)
         .bind(part.batch_id)
-        .bind(part.text)
+        .bind(text)
         .bind(kind)
         .bind(part.sticker_hash)
         .bind(part.quote_message_id)
@@ -56,7 +104,7 @@ impl SqliteStore {
         .bind(part.part_count)
         .bind(part.now)
         .bind(part.now)
-        .execute(&self.pool)
+        .execute(connection)
         .await?;
         Ok(id)
     }

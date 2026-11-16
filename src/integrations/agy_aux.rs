@@ -40,8 +40,12 @@ const VISION_TIMEOUT: Duration = Duration::from_secs(120);
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(150);
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// Polls with an unchanged step stream before a model text counts as
-/// the finished answer.
-const SETTLE_POLLS: u8 = 2;
+/// the finished answer. Four polls (~1.6 s of byte-stability): two proved
+/// too few in production — on 2026-11-11 a group's compaction failed
+/// `malformed` twice while the model's final step text was a fully valid
+/// summary, i.e. the client had settled on an earlier stable state of the
+/// still-growing answer.
+const SETTLE_POLLS: u8 = 4;
 
 /// Decides when a polled step stream counts as settled on an answer.
 ///
@@ -429,6 +433,8 @@ mod settle_tests {
         // Text still streaming in under the same step count: must not settle.
         assert!(!t.observe(5, Some("{\"summary\":\"本群是以高达为核心的交流群\"}")));
         assert!(!t.observe(5, Some("{\"summary\":\"本群是以高达为核心的交流群\"}")));
+        assert!(!t.observe(5, Some("{\"summary\":\"本群是以高达为核心的交流群\"}")));
+        assert!(!t.observe(5, Some("{\"summary\":\"本群是以高达为核心的交流群\"}")));
         assert!(t.observe(5, Some("{\"summary\":\"本群是以高达为核心的交流群\"}")));
     }
 
@@ -436,6 +442,8 @@ mod settle_tests {
     fn new_steps_reset_settling() {
         let mut t = SettleTracker::default();
         assert!(!t.observe(5, Some("done")));
+        assert!(!t.observe(6, Some("done")));
+        assert!(!t.observe(6, Some("done")));
         assert!(!t.observe(6, Some("done")));
         assert!(!t.observe(6, Some("done")));
         assert!(t.observe(6, Some("done")));
@@ -446,6 +454,8 @@ mod settle_tests {
         let mut t = SettleTracker::default();
         assert!(!t.observe(5, Some("done")));
         assert!(!t.observe(5, None));
+        assert!(!t.observe(5, Some("done")));
+        assert!(!t.observe(5, Some("done")));
         assert!(!t.observe(5, Some("done")));
         assert!(!t.observe(5, Some("done")));
         assert!(t.observe(5, Some("done")));

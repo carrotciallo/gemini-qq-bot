@@ -440,3 +440,96 @@ async fn api_v1_persona_edit_round_trips() {
     let body = get_json(state, "/api/v1/persona").await;
     assert_eq!(body["is_default"], json!(true));
 }
+
+async fn post_json(state: Arc<AdminState>, uri: &str) -> (u16, serde_json::Value) {
+    use tower::ServiceExt;
+
+    let response = router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .expect("请求"),
+        )
+        .await
+        .expect("响应");
+    let status = response.status().as_u16();
+    let bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("读主体")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn imagegen_settings_roundtrip_and_validation() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let pool = crate::store::migrations::open_and_migrate(&dir.path().join("bot.sqlite3"))
+        .await
+        .expect("迁移");
+    let store = Arc::new(SqliteStore::new(pool));
+    let state = state_for(&dir, store);
+
+    let body = get_json(Arc::clone(&state), "/internal/v1/imagegen/settings").await;
+    assert_eq!(body["self_daily_cap"], json!(15));
+    assert_eq!(body["request_daily_cap"], json!(5));
+    assert_eq!(body["request_cooldown_min"], json!(10));
+    assert_eq!(body["owner_configured"], json!(false));
+
+    let (status, body) = put_json(
+        Arc::clone(&state),
+        "/internal/v1/imagegen/settings",
+        json!({ "self_daily_cap": 3, "request_cooldown_min": 0 }),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["self_daily_cap"], json!(3));
+    assert_eq!(body["request_daily_cap"], json!(5));
+    assert_eq!(body["request_cooldown_min"], json!(0));
+
+    let (status, _) = put_json(
+        state,
+        "/internal/v1/imagegen/settings",
+        json!({ "request_daily_cap": 201 }),
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn imagegen_usage_counts_and_reset_zeroes() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let pool = crate::store::migrations::open_and_migrate(&dir.path().join("bot.sqlite3"))
+        .await
+        .expect("迁移");
+    let store = Arc::new(SqliteStore::new(pool));
+    let now = crate::now_unix();
+    store
+        .insert_image_job("1", "500", "42", "self", "p1", false, None, now)
+        .await
+        .expect("登记自主");
+    store
+        .insert_image_job("1", "500", "42", "request", "p2", true, None, now)
+        .await
+        .expect("登记请求");
+    let state = state_for(&dir, store);
+
+    let body = get_json(Arc::clone(&state), "/internal/v1/groups/500/imagegen/usage").await;
+    assert_eq!(body["self"]["used"], json!(1));
+    assert_eq!(body["self"]["cap"], json!(15));
+    assert_eq!(body["requests"][0]["requester_id"], json!("42"));
+    assert_eq!(body["requests"][0]["used"], json!(1));
+    assert_eq!(body["jobs"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["reset_at"], json!(0));
+
+    let (status, body) =
+        post_json(Arc::clone(&state), "/internal/v1/groups/500/imagegen/reset").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["self"]["used"], json!(0));
+    assert_eq!(body["requests"].as_array().map(Vec::len), Some(0));
+    assert!(body["reset_at"].as_i64().unwrap_or(0) > 0);
+}

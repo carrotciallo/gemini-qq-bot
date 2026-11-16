@@ -102,14 +102,20 @@ impl SqliteStore {
     /// Used to show what an incoming quote points at: the id comes from the
     /// wire, so the summary is only ever read back from this group's own log
     /// — an id that was never logged here resolves to nothing.
+    ///
+    /// A picture's logged text is only the `[图片]` placeholder; what the
+    /// picture shows lives in `image_tags`. When tags exist, their
+    /// descriptions stand in for the placeholder, so a quote pointing at a
+    /// picture says what the picture was (2026-11-07: without this the agent
+    /// saw a bare placeholder and answered as if the picture were broken).
     pub async fn group_message_text(
         &self,
         bot_id: &str,
         group_id: &str,
         message_id: &str,
     ) -> BotResult<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT text FROM group_messages
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT text, image_tags FROM group_messages
              WHERE bot_id = ? AND group_id = ? AND message_id = ? LIMIT 1",
         )
         .bind(bot_id)
@@ -117,7 +123,25 @@ impl SqliteStore {
         .bind(message_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(text,)| text))
+        Ok(row.map(|(text, tags)| describe_logged_message(&text, tags.as_deref())))
+    }
+
+    /// When anyone but the bot last spoke in the group (unix seconds), if
+    /// ever. The spontaneous-topic engine measures silence from this.
+    pub async fn last_human_message_at(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+    ) -> BotResult<Option<i64>> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT MAX(created_at) FROM group_messages
+             WHERE bot_id = ? AND group_id = ? AND speaker_role != 'bot'",
+        )
+        .bind(bot_id)
+        .bind(group_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(ts,)| ts))
     }
 
     /// Send-time freshness gate: how many non-bot group messages were
@@ -369,5 +393,38 @@ impl SqliteStore {
         }
         tx.commit().await?;
         Ok(total)
+    }
+}
+
+/// The text a quote summary should speak for one logged message: the
+/// tagger's picture descriptions when the row carries them (the rendered
+/// tag line when a tag has no description), else the logged text itself.
+fn describe_logged_message(text: &str, image_tags: Option<&str>) -> String {
+    let described = image_tags
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|tags| {
+            let arr = tags.as_array()?;
+            let pick = |key: &str| -> Vec<String> {
+                arr.iter()
+                    .filter_map(|t| t.get(key).and_then(serde_json::Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            let lines = pick("description");
+            let lines = if lines.is_empty() {
+                pick("text")
+            } else {
+                lines
+            };
+            (!lines.is_empty()).then(|| lines.join("；"))
+        });
+    match described {
+        Some(desc) if text.trim() == "[图片]" || text.trim().is_empty() => {
+            format!("图片：{desc}")
+        }
+        Some(desc) => format!("{text}（图片：{desc}）"),
+        None => text.to_string(),
     }
 }

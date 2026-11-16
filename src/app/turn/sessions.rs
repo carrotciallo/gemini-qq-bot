@@ -403,7 +403,7 @@ impl TurnExecutor {
         TurnResult::BadOutput
     }
 
-    /// Settle a failed resident turn: close the call, release the batch, and hand
+    /// Settle a failed resident turn: close the call, release covered rows, and hand
     /// the outcome back to the caller.
     pub(super) async fn resident_fail(
         &self,
@@ -413,6 +413,7 @@ impl TurnExecutor {
         session: &Arc<crate::agent::resident::ResidentSession>,
         reason: &str,
         result: TurnResult,
+        coverage: &ResidentCoverage,
     ) -> TurnResult {
         let _ = self
             .store
@@ -469,7 +470,7 @@ impl TurnExecutor {
                 )
                 .await;
         }
-        let _ = self.store.release_events(&job.event_ids).await;
+        let _ = self.store.release_events(&coverage.event_ids()).await;
         result
     }
 

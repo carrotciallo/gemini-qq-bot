@@ -45,6 +45,19 @@ pub struct BatchJob {
     /// the executor's retry mark, nothing else folded in. A retry job's own
     /// no-submission death never arms another replay.
     pub retry: bool,
+    /// A spontaneous-topic opening (schema v1): the batch is synthetic, built
+    /// by the spontaneous engine after a long silence, and the prompt carries
+    /// the topic card. `None` on every human-triggered job.
+    pub spontaneous: Option<SpontaneousBrief>,
+}
+
+/// What a spontaneous opening asks the agent to talk about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpontaneousBrief {
+    /// The topic line, in the group's own words where possible.
+    pub topic: String,
+    /// The angle or hook for opening on it; empty when the topic speaks for itself.
+    pub angle: String,
 }
 
 /// Result of running one batch.
@@ -128,7 +141,10 @@ impl Scheduler {
             let mut lanes = self.lanes.lock().await;
             let lane = lanes.entry(group_id.clone()).or_default();
             if lane.halted {
-                lane.queue.push_back(job);
+                // A rejected opening is terminal, not a deferred human batch.
+                if job.spontaneous.is_none() {
+                    lane.queue.push_back(job);
+                }
                 return false;
             }
             // Merge instead of queueing a second batch behind a running turn: a job
@@ -141,6 +157,8 @@ impl Scheduler {
             // handled above), so the merged job is guaranteed to be picked up.
             if lane.running
                 && let Some(tail) = lane.queue.back_mut()
+                && tail.spontaneous.is_none()
+                && job.spontaneous.is_none()
                 && tail.event_ids.len() + job.event_ids.len() <= self.merge_limits.max_messages
                 && tail.chars + job.chars <= self.merge_limits.max_chars
                 && tail.images + job.images <= self.merge_limits.max_images
@@ -312,6 +330,7 @@ mod tests {
             flooded: false,
             flood_background: None,
             retry: false,
+            spontaneous: None,
         }
     }
 
@@ -326,6 +345,7 @@ mod tests {
             flooded: false,
             flood_background: None,
             retry: false,
+            spontaneous: None,
         }
     }
 
@@ -494,6 +514,43 @@ mod tests {
         assert_eq!(ran[1].batch_id, "b2", "保留先到批次的 batch_id");
         assert_eq!(ran[1].event_ids, vec![2, 3, 4], "event_ids 不丢不重");
         assert!(ran[1].privileged, "privileged 取或");
+    }
+
+    #[tokio::test]
+    async fn spontaneous_jobs_never_merge_with_humans_or_wait_in_rejected_lanes() {
+        let scheduler = Scheduler::new(1, BatchLimits::default());
+        let exec = Arc::new(BlockingExecutor::new());
+        scheduler
+            .enqueue(Arc::clone(&exec), job_with_ids("100", "running", &[1], 10))
+            .await;
+        wait_until(|| exec.started().len() == 1).await;
+        let human = job_with_ids("100", "human", &[2], 10);
+        let mut opening = job_with_ids("100", "opening", &[3], 10);
+        opening.spontaneous = Some(SpontaneousBrief {
+            topic: "weather".into(),
+            angle: String::new(),
+        });
+        scheduler.enqueue(Arc::clone(&exec), human.clone()).await;
+        scheduler.enqueue(Arc::clone(&exec), opening.clone()).await;
+        scheduler
+            .enqueue(Arc::clone(&exec), job_with_ids("100", "human2", &[4], 10))
+            .await;
+        assert_eq!(scheduler.queued("100").await, 3);
+        {
+            let mut lanes = scheduler.lanes.lock().await;
+            lanes.get_mut("100").unwrap().halted = true;
+        }
+        assert!(!scheduler.enqueue(Arc::clone(&exec), opening.clone()).await);
+        assert_eq!(
+            scheduler.queued("100").await,
+            3,
+            "rejected opening must not be retained"
+        );
+        let cancelled = scheduler.resume_lane("100").await;
+        assert_eq!(cancelled.len(), 3);
+        assert_eq!(cancelled[0], human);
+        assert_eq!(cancelled[1], opening);
+        exec.release();
     }
 
     #[tokio::test]

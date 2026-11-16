@@ -2,18 +2,20 @@
 //! Moved out of turn.rs verbatim (std-split-turn-executor); logic unchanged.
 
 use super::*;
+use crate::agent::barrier::step_counts;
+use crate::store::ResidentCounts;
 
 impl TurnExecutor {
     /// Fixed header prepended to every inserted batch. The agent must fold the
     /// new messages into the turn it is already answering instead of starting a
     /// second reply, so the instruction is stated before the rendered batch.
-    pub(super) const RESIDENT_INSERT_HEADER: &'static str = "## 本轮新增消息（并入当前回答）\n\n以下消息在你生成这一轮回答的过程中到达。把它们并入**同一个**回答，\n不要另起一轮，不要重复已经说过的内容，不要给这些消息填 quote_ref：\n\n";
+    pub(super) const RESIDENT_INSERT_HEADER: &'static str = "## 本轮新增消息（并入当前回答）\n\n以下消息在你生成这一轮回答的过程中到达。把它们并入**同一个**回答，\n不要另起一轮，不要重复已经说过的内容。新增 m 编号可作 quote_ref，u 编号可用于本轮成员引用；原编号不变：\n\n";
 
     /// Header for an insert delivered after an ESC interrupt: the model can
     /// see the interrupt in its TUI, so the header says plainly that the
     /// generation it was in the middle of was cut for these messages, and
     /// the steps it already completed are still in the conversation.
-    pub(super) const RESIDENT_INSERT_HEADER_ESC: &'static str = "## 本轮新增消息（生成已被打断）\n\n以下消息在你生成这一轮回答的过程中到达，刚才那段生成已为此中断。\n结合本轮最初的问题与已经完成的内容，把它们并入，给出**一个完整**的回答，\n不要另起一轮，不要重复已经说过的内容，不要给这些消息填 quote_ref：\n\n";
+    pub(super) const RESIDENT_INSERT_HEADER_ESC: &'static str = "## 本轮新增消息（生成已被打断）\n\n以下消息在你生成这一轮回答的过程中到达，刚才那段生成已为此中断。\n结合本轮最初的问题与已经完成的内容，把它们并入，给出**一个完整**的回答，\n不要另起一轮，不要重复已经说过的内容。新增 m 编号可作 quote_ref，u 编号可用于本轮成员引用；原编号不变：\n\n";
 
     /// The one execution path: one long-lived TUI per group, one logical turn per
     /// claim.
@@ -31,10 +33,11 @@ impl TurnExecutor {
         group: &crate::store::GroupRecord,
         now: i64,
         turn_started: std::time::Instant,
+        insert_batches: &mut Vec<String>,
     ) -> TurnResult {
         let manager = &self.resident;
 
-        let prepared = match self.prepare_turn(job, group, now).await {
+        let mut prepared = match self.prepare_turn(job, group, now).await {
             Ok(prepared) => prepared,
             Err(result) => return result,
         };
@@ -92,6 +95,18 @@ impl TurnExecutor {
             }
         };
 
+        let mut coverage = ResidentCoverage::default();
+        coverage.batches.push(ResidentDelivery {
+            batch_id: job.batch_id.clone(),
+            event_ids: job.event_ids.clone(),
+            newest: prepared
+                .messages
+                .iter()
+                .map(|m| m.received_at)
+                .max()
+                .unwrap_or(now),
+            privileged: job.privileged,
+        });
         let agent_started = std::time::Instant::now();
         let receipt = match session.deliver(&prepared.prompt).await {
             Ok(receipt) => receipt,
@@ -104,6 +119,7 @@ impl TurnExecutor {
                         &session,
                         err.audit_tag(),
                         TurnResult::AgentFailed,
+                        &coverage,
                     )
                     .await;
             }
@@ -129,18 +145,6 @@ impl TurnExecutor {
             .await;
 
         let mut spec = TurnSpec::new(receipt.step_idx);
-        let mut coverage = ResidentCoverage::default();
-        coverage.batches.push(ResidentDelivery {
-            batch_id: job.batch_id.clone(),
-            event_ids: job.event_ids.clone(),
-            newest: prepared
-                .messages
-                .iter()
-                .map(|m| m.received_at)
-                .max()
-                .unwrap_or(now),
-            privileged: job.privileged,
-        });
         let mut inserts = 0u32;
         // Salvaged-delivery hold state (see the Deliver guard below): the
         // last step text a repair was seen on, and whether the hold has
@@ -148,9 +152,6 @@ impl TurnExecutor {
         let mut salvage_seen: Option<(i64, String)> = None;
         let mut salvage_hold_audited = false;
         let mut first_turn_nudged = false;
-        // MCP channel: when the last insertion landed. A submission older
-        // than this is a pre-insertion draft and never commits.
-        let mut last_insert_at: i64 = 0;
         // The pending set the last held-insert audit was written for, so a
         // batch that stays held does not re-audit on every poll tick (ESC
         // mode judges on every tick, not just idle-screen ones).
@@ -183,21 +184,6 @@ impl TurnExecutor {
             turn_started + std::time::Duration::from_secs(limits.hard_cap_s.max(1) as u64);
 
         loop {
-            // Watchdog: a dead child or a stalled stream while a turn is in flight
-            // is a crash, which takes the same path as any other agent failure.
-            if let Err(err) = session.tick(true).await {
-                return self
-                    .resident_fail(
-                        manager,
-                        job,
-                        &call_id,
-                        &session,
-                        err.audit_tag(),
-                        TurnResult::AgentFailed,
-                    )
-                    .await;
-            }
-
             // Insertion window: only while the turn is young enough to absorb more
             // messages. Past the soft cap the turn keeps running but stops taking
             // new work, so it converges instead of chasing the conversation.
@@ -207,18 +193,18 @@ impl TurnExecutor {
                         manager,
                         &session,
                         &mut coverage,
-                        &prepared,
+                        &mut prepared,
                         group,
                         &mut inserts,
                         &mut held_seen,
                         turn_started,
                         limits,
+                        insert_batches,
                     )
                     .await
                 {
                     Ok(Some(step_idx)) => {
                         spec.accept_insert(step_idx);
-                        last_insert_at = crate::now_unix();
                     }
                     Ok(None) => {}
                     Err(result) => {
@@ -230,6 +216,7 @@ impl TurnExecutor {
                                 &session,
                                 "interrupt_failed",
                                 result,
+                                &coverage,
                             )
                             .await;
                     }
@@ -262,6 +249,24 @@ impl TurnExecutor {
                     validator_ref,
                 )
                 .await;
+            // evaluate() refreshes the owned step stream and progress clock.
+            // Judge stalls afterwards, never against the previous poll's clock.
+            // A read error retains its own classification in the match below.
+            if evaluated.is_ok()
+                && let Err(err) = session.tick(true).await
+            {
+                return self
+                    .resident_fail(
+                        manager,
+                        job,
+                        &call_id,
+                        &session,
+                        err.audit_tag(),
+                        TurnResult::AgentFailed,
+                        &coverage,
+                    )
+                    .await;
+            }
             match evaluated {
                 // A refusal while the prompt is still absent is a stub. The
                 // model rewrites the same step; accepting it deletes the batch.
@@ -298,7 +303,8 @@ impl TurnExecutor {
                 }
                 Ok((parsed, Verdict::Deliver { idx, text })) => {
                     let drafts = list_drafts(&parsed.events, &spec).len() as i64;
-                    let steps = parsed.events.len() as i64;
+                    let counts = step_counts(&parsed.events, &spec);
+                    let steps = counts.session_events;
                     // An upstream content-filter refusal leaves its wording
                     // in the step stream or on the PTY screen; the text
                     // channel checks its own text separately below (a valid
@@ -314,10 +320,13 @@ impl TurnExecutor {
                                 job,
                                 &call_id,
                                 &prepared,
-                                steps,
-                                drafts,
-                                i64::from(inserts),
-                                last_insert_at,
+                                ResidentCounts {
+                                    session_events: counts.session_events,
+                                    turn_delta: counts.turn_delta,
+                                    last_progress_idx: counts.last_progress_idx,
+                                    insert_count: i64::from(inserts),
+                                    draft_count: drafts,
+                                },
                                 &coverage,
                                 prompt_rejected,
                                 first_turn_nudged,
@@ -343,6 +352,7 @@ impl TurnExecutor {
                                                 &session,
                                                 err.audit_tag(),
                                                 TurnResult::AgentFailed,
+                                                &coverage,
                                             )
                                             .await;
                                     }
@@ -362,9 +372,13 @@ impl TurnExecutor {
                                         },
                                         prepared,
                                         coverage,
-                                        steps,
-                                        drafts,
-                                        i64::from(inserts),
+                                        ResidentCounts {
+                                            session_events: counts.session_events,
+                                            turn_delta: counts.turn_delta,
+                                            last_progress_idx: counts.last_progress_idx,
+                                            insert_count: i64::from(inserts),
+                                            draft_count: drafts,
+                                        },
                                     )
                                     .await;
                             }
@@ -391,7 +405,16 @@ impl TurnExecutor {
                     {
                         let _ = self
                             .store
-                            .record_resident_counts(&call_id, steps, i64::from(inserts), drafts)
+                            .record_resident_counts(
+                                &call_id,
+                                ResidentCounts {
+                                    session_events: counts.session_events,
+                                    turn_delta: counts.turn_delta,
+                                    last_progress_idx: counts.last_progress_idx,
+                                    insert_count: i64::from(inserts),
+                                    draft_count: drafts,
+                                },
+                            )
                             .await;
                         return self
                             .retire_for_content_filter(manager, job, &call_id, &coverage)
@@ -400,7 +423,16 @@ impl TurnExecutor {
                     if steps >= RESIDENT_STEP_ROTATE_LIMIT && contract::is_bare_refusal(&text) {
                         let _ = self
                             .store
-                            .record_resident_counts(&call_id, steps, i64::from(inserts), drafts)
+                            .record_resident_counts(
+                                &call_id,
+                                ResidentCounts {
+                                    session_events: counts.session_events,
+                                    turn_delta: counts.turn_delta,
+                                    last_progress_idx: counts.last_progress_idx,
+                                    insert_count: i64::from(inserts),
+                                    draft_count: drafts,
+                                },
+                            )
                             .await;
                         manager
                             .audit(
@@ -430,7 +462,16 @@ impl TurnExecutor {
                     if shape.addressed_silence(coverage.any_privileged()) {
                         let _ = self
                             .store
-                            .record_resident_counts(&call_id, steps, i64::from(inserts), drafts)
+                            .record_resident_counts(
+                                &call_id,
+                                ResidentCounts {
+                                    session_events: counts.session_events,
+                                    turn_delta: counts.turn_delta,
+                                    last_progress_idx: counts.last_progress_idx,
+                                    insert_count: i64::from(inserts),
+                                    draft_count: drafts,
+                                },
+                            )
                             .await;
                         manager
                             .audit(
@@ -478,7 +519,16 @@ impl TurnExecutor {
                         .unwrap_or(0);
                     let _ = self
                         .store
-                        .record_resident_counts(&call_id, steps, i64::from(inserts), drafts)
+                        .record_resident_counts(
+                            &call_id,
+                            ResidentCounts {
+                                session_events: counts.session_events,
+                                turn_delta: counts.turn_delta,
+                                last_progress_idx: counts.last_progress_idx,
+                                insert_count: i64::from(inserts),
+                                draft_count: drafts,
+                            },
+                        )
                         .await;
                     manager
                         .audit(
@@ -504,20 +554,8 @@ impl TurnExecutor {
                         )
                         .await
                         .unwrap_or_else(|early| early);
-                    // A send or a chosen silence is a real resident round: it is the
-                    // only thing that walks the respawn ladder back down. Nothing
-                    // else reaches this point, so nothing can excuse a failing
-                    // session.
-                    if matches!(result, TurnResult::Replied | TurnResult::Silent) {
-                        manager.note_respawn_clean(&job.group_id).await;
-                        // A delivered round is also a clean round for the
-                        // seed quarantine: ten in a row earn the full seed
-                        // back (see SqliteStore::note_seed_clean_round).
-                        let _ = self
-                            .store
-                            .note_seed_clean_round(&self.bot_id, &job.group_id, crate::now_unix())
-                            .await;
-                    }
+                    self.note_clean_resident_round(manager, &job.group_id, &result)
+                        .await;
 
                     // Probe: a delivered round is the only kind that feeds the
                     // rolling window; failures are counted by the caller of
@@ -549,10 +587,20 @@ impl TurnExecutor {
                     if !screen_is_idle_for_insert(&session.screen_text()) => {}
                 Ok((parsed, Verdict::Failed { idx, reason })) => {
                     let drafts = list_drafts(&parsed.events, &spec).len() as i64;
-                    let steps = parsed.events.len() as i64;
+                    let counts = step_counts(&parsed.events, &spec);
+                    let steps = counts.session_events;
                     let _ = self
                         .store
-                        .record_resident_counts(&call_id, steps, i64::from(inserts), drafts)
+                        .record_resident_counts(
+                            &call_id,
+                            ResidentCounts {
+                                session_events: counts.session_events,
+                                turn_delta: counts.turn_delta,
+                                last_progress_idx: counts.last_progress_idx,
+                                insert_count: i64::from(inserts),
+                                draft_count: drafts,
+                            },
+                        )
                         .await;
                     manager
                         .audit(
@@ -596,6 +644,7 @@ impl TurnExecutor {
                                         &session,
                                         err.audit_tag(),
                                         TurnResult::AgentFailed,
+                                        &coverage,
                                     )
                                     .await;
                             }
@@ -642,6 +691,7 @@ impl TurnExecutor {
                                 &session,
                                 "contract_invalid",
                                 TurnResult::BadOutput,
+                                &coverage,
                             )
                             .await;
                     }
@@ -657,7 +707,8 @@ impl TurnExecutor {
                         && reasons[0] == "no_agent_text_after_last_user"
                         && screen_is_idle_for_insert(&session.screen_text())
                     {
-                        let steps = parsed.events.len() as i64;
+                        let counts = step_counts(&parsed.events, &spec);
+                        let steps = counts.session_events;
                         let drafts = list_drafts(&parsed.events, &spec).len() as i64;
                         match self
                             .resident_submission_outcome(
@@ -665,10 +716,13 @@ impl TurnExecutor {
                                 job,
                                 &call_id,
                                 &prepared,
-                                steps,
-                                drafts,
-                                i64::from(inserts),
-                                last_insert_at,
+                                ResidentCounts {
+                                    session_events: counts.session_events,
+                                    turn_delta: counts.turn_delta,
+                                    last_progress_idx: counts.last_progress_idx,
+                                    insert_count: i64::from(inserts),
+                                    draft_count: drafts,
+                                },
                                 &coverage,
                                 texts_show_prompt_rejection(
                                     parsed.events.iter().map(|e| e.text.as_str()),
@@ -696,6 +750,7 @@ impl TurnExecutor {
                                                 &session,
                                                 err.audit_tag(),
                                                 TurnResult::AgentFailed,
+                                                &coverage,
                                             )
                                             .await;
                                     }
@@ -715,9 +770,13 @@ impl TurnExecutor {
                                         },
                                         prepared,
                                         coverage,
-                                        steps,
-                                        drafts,
-                                        i64::from(inserts),
+                                        ResidentCounts {
+                                            session_events: counts.session_events,
+                                            turn_delta: counts.turn_delta,
+                                            last_progress_idx: counts.last_progress_idx,
+                                            insert_count: i64::from(inserts),
+                                            draft_count: drafts,
+                                        },
                                     )
                                     .await;
                             }
@@ -790,6 +849,7 @@ impl TurnExecutor {
                             &session,
                             err.audit_tag(),
                             TurnResult::AgentFailed,
+                            &coverage,
                         )
                         .await;
                 }
@@ -816,6 +876,7 @@ impl TurnExecutor {
                         &session,
                         "hard_cap",
                         TurnResult::AgentFailed,
+                        &coverage,
                     )
                     .await;
             }
@@ -829,9 +890,8 @@ impl TurnExecutor {
     /// text). Failure semantics mirror the text path: no submission at all
     /// is this channel's `malformed` — the session retires and the batch goes back
     /// to the pool behind a respawn backoff; a deep bare refusal retires the same
-    /// way. A submission that predates the last insertion is a draft: the model was
-    /// told to fold the insertion in and submit again, so the turn keeps waiting for
-    /// the newer one.
+    /// way. Only the current confirmed input token can commit. Insertions rotate
+    /// that token, so timestamps never decide whether a draft covered new input.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resident_submission_outcome(
         &self,
@@ -839,17 +899,21 @@ impl TurnExecutor {
         job: &BatchJob,
         call_id: &str,
         prepared: &PreparedTurn,
-        steps: i64,
-        drafts: i64,
-        inserts: i64,
-        last_insert_at: i64,
+        counts: ResidentCounts,
         coverage: &ResidentCoverage,
         prompt_rejected: bool,
         already_nudged: bool,
     ) -> SubmissionOutcome {
+        let steps = counts.session_events;
+        let drafts = counts.draft_count;
+        let inserts = counts.insert_count;
         let Some(token) = prepared.turn_token.as_deref() else {
             return SubmissionOutcome::Done(TurnResult::AgentFailed);
         };
+        match self.store.armed_turn(&job.group_id).await {
+            Ok(Some(arm)) if arm.turn_token == token && arm.expires_at >= crate::now_unix() => {}
+            _ => return SubmissionOutcome::Wait,
+        }
         let rows = match self.store.submissions_for(token).await {
             Ok(rows) => rows,
             Err(_) => return SubmissionOutcome::Wait,
@@ -857,10 +921,7 @@ impl TurnExecutor {
         let accepted: Vec<&crate::store::TurnSubmission> =
             rows.iter().filter(|r| r.verdict == "accepted").collect();
         let Some(candidate) = accepted.last() else {
-            let _ = self
-                .store
-                .record_resident_counts(call_id, steps, inserts, drafts)
-                .await;
+            let _ = self.store.record_resident_counts(call_id, counts).await;
             if prompt_rejected {
                 // The prompt was refused upstream, so of course nothing was
                 // submitted: a content-filter round, not a no-submission
@@ -919,12 +980,14 @@ impl TurnExecutor {
             // For an opted-in group, arm the intake to claim exactly those
             // rows as the next job — fresh session, fresh token, ahead of
             // any merge. A retry job never re-arms.
-            if retry_arm_due(
-                job.retry,
-                self.no_submission_retry_groups
-                    .iter()
-                    .any(|g| g == &job.group_id),
-            ) {
+            if job.spontaneous.is_none()
+                && retry_arm_due(
+                    job.retry,
+                    self.no_submission_retry_groups
+                        .iter()
+                        .any(|g| g == &job.group_id),
+                )
+            {
                 manager.arm_retry(&job.group_id, retry_ids).await;
                 manager
                     .audit(
@@ -937,14 +1000,11 @@ impl TurnExecutor {
         };
         // The settle second keeps a just-landed call from being committed
         // while the model is still mid-gesture after it.
-        if candidate.created_at < last_insert_at || crate::now_unix() - candidate.created_at < 1 {
+        if crate::now_unix() - candidate.created_at < 1 {
             return SubmissionOutcome::Wait;
         }
         if steps >= RESIDENT_STEP_ROTATE_LIMIT && payload_is_bare_refusal(&candidate.payload) {
-            let _ = self
-                .store
-                .record_resident_counts(call_id, steps, inserts, drafts)
-                .await;
+            let _ = self.store.record_resident_counts(call_id, counts).await;
             manager
                 .audit(
                     &job.group_id,
@@ -995,19 +1055,16 @@ impl TurnExecutor {
         timing: TurnTiming,
         prepared: PreparedTurn,
         coverage: ResidentCoverage,
-        steps: i64,
-        drafts: i64,
-        inserts: i64,
+        counts: ResidentCounts,
     ) -> TurnResult {
+        let steps = counts.session_events;
+        let drafts = counts.draft_count;
         let count = self
             .store
             .bump_agy_turn_count(&self.bot_id, &job.group_id, crate::now_unix())
             .await
             .unwrap_or(0);
-        let _ = self
-            .store
-            .record_resident_counts(call_id, steps, inserts, drafts)
-            .await;
+        let _ = self.store.record_resident_counts(call_id, counts).await;
         manager
             .audit(
                 &job.group_id,
@@ -1021,9 +1078,8 @@ impl TurnExecutor {
             .finish_turn_with_coverage(job, call_id, &payload, timing, prepared, coverage)
             .await
             .unwrap_or_else(|early| early);
-        if matches!(result, TurnResult::Replied | TurnResult::Silent) {
-            manager.note_respawn_clean(&job.group_id).await;
-        }
+        self.note_clean_resident_round(manager, &job.group_id, &result)
+            .await;
         let contract_ok = !matches!(result, TurnResult::BadOutput);
         self.apply_probe(
             manager,
@@ -1042,6 +1098,23 @@ impl TurnExecutor {
         result
     }
 
+    /// Only a delivered reply or chosen silence advances recovery. Both output
+    /// channels call this exactly once after final validation/commit.
+    async fn note_clean_resident_round(
+        &self,
+        manager: &Arc<crate::app::resident::ResidentManager>,
+        group_id: &str,
+        result: &TurnResult,
+    ) {
+        if matches!(result, TurnResult::Replied | TurnResult::Silent) {
+            manager.note_respawn_clean(group_id).await;
+            let _ = self
+                .store
+                .note_seed_clean_round(&self.bot_id, group_id, crate::now_unix())
+                .await;
+        }
+    }
+
     /// Clear the conversation and audit when a delivered round hits the turn
     /// cap or the step-depth cap. Extracted so the two finish paths cannot
     /// drift, and so the rotation contract can be tested without a PTY.
@@ -1049,9 +1122,13 @@ impl TurnExecutor {
         &self,
         group_id: &str,
         count: i64,
-        steps: i64,
+        session_events: i64,
     ) {
-        let step_due = steps >= RESIDENT_STEP_ROTATE_LIMIT;
+        // Rotation keeps reading the SESSION cumulative event count: that is the
+        // threshold this repo shipped and the owner froze at 40. The round delta
+        // is recorded alongside it but deliberately does not drive rotation —
+        // switching inputs here would silently re-tune the cap (K2/R27).
+        let step_due = session_events >= RESIDENT_STEP_ROTATE_LIMIT;
         if !(rotation_due(
             count,
             super::turn_limit_value(&self.conversation_turn_limit),
@@ -1065,7 +1142,7 @@ impl TurnExecutor {
             .set_conversation_id(&self.bot_id, group_id, None, now)
             .await;
         let why = if step_due {
-            format!("ops.conversation.rotated.g{group_id}.steps{steps}")
+            format!("ops.conversation.rotated.g{group_id}.steps{session_events}")
         } else {
             format!("ops.conversation.rotated.g{group_id}.after{count}")
         };
@@ -1085,12 +1162,13 @@ impl TurnExecutor {
         manager: &Arc<crate::app::resident::ResidentManager>,
         session: &Arc<crate::agent::resident::ResidentSession>,
         coverage: &mut ResidentCoverage,
-        prepared: &PreparedTurn,
+        prepared: &mut PreparedTurn,
         group: &crate::store::GroupRecord,
         inserts: &mut u32,
         held_seen: &mut Option<(usize, i64)>,
         turn_started: std::time::Instant,
         limits: ResidentLimits,
+        insert_batches: &mut Vec<String>,
     ) -> Result<Option<i64>, TurnResult> {
         let rows = match self
             .store
@@ -1240,6 +1318,9 @@ impl TurnExecutor {
         // never reach this arm: `decide` holds them for the next full turn.
         let event_ids: Vec<i64> = chosen.iter().map(|&idx| rows[idx].id).collect();
         let batch_id = format!("b{}-{}-ins{}", group.group_id, now, *inserts);
+        if !insert_batches.contains(&batch_id) {
+            insert_batches.push(batch_id.clone());
+        }
         let event_ids = match self.store.claim_batch(&event_ids, &batch_id).await {
             Ok(claimed) if !claimed.is_empty() => claimed,
             _ => return Ok(None),
@@ -1250,11 +1331,37 @@ impl TurnExecutor {
             .filter(|(row, _)| event_ids.contains(&row.id))
             .map(|(_, message)| message)
             .collect();
-        let body = render_insert_lines(&parsed);
+        let body = render_insert_lines(&parsed, prepared.messages.len() + 1);
         if body.is_empty() {
             let _ = self.store.release_events(&event_ids).await;
             return Ok(None);
         }
+        // Revoke the current input generation BEFORE interrupt/paste. A delayed
+        // request that passed its MCP precheck is fenced again at persistence.
+        // The fresh token is published in the insert card but armed only after
+        // confirmation, so neither old drafts nor unconfirmed input can commit.
+        let insertion_arm = if let Some(token) = prepared.turn_token.as_deref() {
+            let arm = self.store.armed_turn(&group.group_id).await;
+            let Ok(Some(arm)) = arm else {
+                let _ = self.store.release_events(&event_ids).await;
+                manager.close(&group.group_id).await;
+                return Err(TurnResult::AgentFailed);
+            };
+            if arm.turn_token != token
+                || self
+                    .store
+                    .disarm_turn(&group.group_id, token)
+                    .await
+                    .is_err()
+            {
+                let _ = self.store.release_events(&event_ids).await;
+                manager.close(&group.group_id).await;
+                return Err(TurnResult::AgentFailed);
+            }
+            Some((arm, new_turn_token()))
+        } else {
+            None
+        };
         // ESC mode with the turn still generating: stop the generation
         // first, then paste into the idle prompt. Interrupting only after
         // the claim and the render means a batch that fails to assemble
@@ -1292,7 +1399,12 @@ impl TurnExecutor {
         } else {
             Self::RESIDENT_INSERT_HEADER
         };
-        let text = format!("{}{}", header, body);
+        let mut text = format!("{}{}", header, body);
+        if let Some((_, token)) = &insertion_arm {
+            text.push_str(&format!(
+                "\n\n## 本轮输入代次更新\n旧 turn_token 已失效。结合以上新增消息重新提交，submit_reply 和 generate_image 均使用最新 turn_token：{token}\n若窗口暂未开放，稍后用此口令重试，不要回用旧口令。\n"
+            ));
+        }
         // One paste, five seconds to confirm, on both paths. The idle
         // path used to get one second on the theory that a missed paste
         // is harmless — the rows are released and the next turn takes
@@ -1309,8 +1421,8 @@ impl TurnExecutor {
         // Even five seconds lost the race once more (2026-11-04: the
         // same insert pasted twice inside one turn), so confirmation
         // now gets a second look against the same pre-paste floor
-        // after an 8s wait (`deliver_insert`) before the rows are
-        // released as uninserted.
+        // after an 8s wait (`deliver_insert`). If still unconfirmed, retire
+        // the uncertain conversation before allowing a fresh-turn retry.
         let confirm_window = std::time::Duration::from_secs(5);
         let receipt = match session
             .deliver_insert(&text, confirm_window, std::time::Duration::from_secs(8))
@@ -1318,8 +1430,26 @@ impl TurnExecutor {
         {
             Ok(receipt) => receipt,
             Err(_) => {
-                let _ = self.store.release_events(&event_ids).await;
-                return Ok(None);
+                // The paste may have landed. Never repeat it on this session
+                // or accept a late submission from the abandoned turn.
+                manager.close(&group.group_id).await;
+                manager
+                    .audit(
+                        &group.group_id,
+                        &format!("resident.insert.delivery_unknown.g{}", group.group_id),
+                    )
+                    .await;
+                if self
+                    .store
+                    .set_conversation_id(&self.bot_id, &group.group_id, None, crate::now_unix())
+                    .await
+                    .is_ok()
+                {
+                    let _ = self.store.release_events(&event_ids).await;
+                }
+                // If retiring the persisted conversation failed, retain this
+                // uncertain claim rather than immediately replaying the paste.
+                return Err(TurnResult::AgentFailed);
             }
         };
         *inserts += 1;
@@ -1333,6 +1463,45 @@ impl TurnExecutor {
             // carries the same weight as one that claimed its own turn.
             privileged: mentions_bot,
         });
+        if let Some((mut arm, token)) = insertion_arm {
+            arm.turn_token = token.clone();
+            arm.armed_at = crate::now_unix();
+            if !matches!(
+                self.store
+                    .arm_confirmed_turn(&self.bot_id, &arm, &coverage.event_ids())
+                    .await,
+                Ok(true)
+            ) {
+                manager.close(&group.group_id).await;
+                return Err(TurnResult::AgentFailed);
+            }
+            prepared.turn_token = Some(token);
+        }
+        // Keep every original ref stable. Only confirmed inputs extend the
+        // validator and resolver; the pre-paste card used these same indices.
+        let previous_len = prepared.messages.len();
+        prepared.messages.extend(parsed);
+        let (expanded, expanded_scope) = build_prompt_batch(
+            &prepared.messages,
+            Default::default(),
+            None,
+            None,
+            None,
+            Default::default(),
+            Vec::new(),
+            &std::collections::HashMap::new(),
+        );
+        prepared
+            .prompt_batch
+            .messages
+            .extend(expanded.messages.into_iter().skip(previous_len));
+        prepared.scope.message_refs = expanded_scope.message_refs;
+        prepared.scope.speaker_refs = expanded_scope.speaker_refs;
+        prepared.members = self
+            .store
+            .list_members(&self.bot_id, &group.group_id)
+            .await
+            .map_err(|_| TurnResult::AgentFailed)?;
         manager
             .audit(
                 &group.group_id,

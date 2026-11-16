@@ -58,9 +58,9 @@ impl SendGroupMsg {
     /// A sticker is an animated-image segment. `sub_type: 1` is what makes QQ
     /// render it as a sticker instead of a plain picture.
     ///
-    /// The bytes are shrunk until the base64 payload fits [`STICKER_MAX_BASE64_BYTES`].
-    /// A sticker taken from the library can be close to a megabyte, and base64 adds
-    /// a third on top, so sending the file verbatim overflows the frame budget.
+    /// Animated stickers go out byte for byte at any size; stills are
+    /// normalized to a QQ-ready JPEG by `fit_for_sticker`. Sends carry no
+    /// size cap (user ruling, 2026-11-11).
     pub fn sticker(group_id: &str, bytes: &[u8]) -> Option<Self> {
         Self::sticker_inner(group_id, bytes, None).map(|(msg, _)| msg)
     }
@@ -71,9 +71,8 @@ impl SendGroupMsg {
         Self::sticker_inner(group_id, bytes, Some(quote_message_id)).map(|(msg, _)| msg)
     }
 
-    /// Build a sticker frame and report which payload actually went on the wire,
-    /// so the send path can audit a downgraded animation instead of it vanishing
-    /// silently.
+    /// Build a sticker frame and report which payload went on the wire:
+    /// the animated original, or a still normalized from the source bytes.
     pub fn sticker_tracked(
         group_id: &str,
         bytes: &[u8],
@@ -87,25 +86,19 @@ impl SendGroupMsg {
         bytes: &[u8],
         quote_message_id: Option<&str>,
     ) -> Option<(Self, StickerPayload)> {
-        // An animated sticker must be forwarded verbatim. `fit_for_sticker` decodes
-        // through `load_from_memory().into_rgb8()` and re-encodes JPEG, which keeps
-        // exactly one frame — every GIF that went through it arrived on QQ as a still
-        // (2026-10-28, user-directed). The library already stores the original bytes,
-        // so the fix is to stop re-encoding them, not to re-encode them better.
+        // An animated sticker must be forwarded verbatim, at any size.
+        // `fit_for_sticker` decodes through `load_from_memory().into_rgb8()`
+        // and re-encodes JPEG, which keeps exactly one frame — every GIF
+        // that went through it arrived on QQ as a still (2026-10-28,
+        // user-directed). An earlier cut also downgraded oversized
+        // animations to a still instead of dropping them; sends carry no
+        // size cap at all now (user ruling, 2026-11-11), so the original
+        // bytes always go out.
         let (payload, kind) = if is_animated_image(bytes) {
-            let encoded = crate::media::collage::base64_encode(bytes);
-            if encoded.len() <= STICKER_MAX_BASE64_BYTES {
-                (encoded, StickerPayload::Animated)
-            } else {
-                // Too big to send untouched. Falling back to the still frame is
-                // better than dropping the sticker, and the caller can tell the two
-                // paths apart from the returned [`StickerPayload`].
-                let still = crate::media::collage::fit_for_sticker(bytes)?;
-                (
-                    crate::media::collage::base64_encode(&still),
-                    StickerPayload::Downgraded,
-                )
-            }
+            (
+                crate::media::collage::base64_encode(bytes),
+                StickerPayload::Animated,
+            )
         } else {
             let jpeg = crate::media::collage::fit_for_sticker(bytes)?;
             (
@@ -113,9 +106,6 @@ impl SendGroupMsg {
                 StickerPayload::Static,
             )
         };
-        if payload.len() > STICKER_MAX_BASE64_BYTES {
-            return None;
-        }
         let url = format!("base64://{payload}");
         let mut segments = Vec::with_capacity(2);
         if let Some(id) = quote_message_id {
@@ -151,6 +141,30 @@ impl SendGroupMsg {
             }
         }
         None
+    }
+
+    /// A plain picture (QQ `sub_type` 0), as opposed to a sticker (`sub_type` 1).
+    ///
+    /// The bytes go out verbatim, at any size: there is no payload cap on
+    /// sends (user ruling, 2026-11-11). This constructor briefly borrowed
+    /// the sticker budget, and every generated picture (900 KB–1 MB, so
+    /// 1.2 MB+ in base64) silently failed that check — the frame was never
+    /// even attempted and the send landed `unknown`. A raw-client control
+    /// send of the same file went through in under two seconds, proving
+    /// the cap was the whole fault. The only refusal left is empty bytes.
+    pub fn image(group_id: &str, bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let payload = crate::media::collage::base64_encode(bytes);
+        Some(Self {
+            group_id: group_id.to_string(),
+            message: json!([{
+                "type": "image",
+                "data": { "file": format!("base64://{payload}"), "sub_type": 0 },
+            }]),
+            auto_escape: Some(false),
+        })
     }
 
     pub fn to_frame(&self, echo: &str) -> Value {
@@ -191,12 +205,10 @@ fn is_animated_image(bytes: &[u8]) -> bool {
 /// Which bytes a sticker frame actually carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StickerPayload {
-    /// A still picture, re-encoded to fit the frame budget.
+    /// A still picture, normalized to a QQ-ready JPEG.
     Static,
     /// A multi-frame GIF or animated WebP, forwarded byte for byte.
     Animated,
-    /// An animation too large to send untouched: it went out as one still frame.
-    Downgraded,
 }
 
 impl StickerPayload {
@@ -204,7 +216,6 @@ impl StickerPayload {
         match self {
             StickerPayload::Static => "static",
             StickerPayload::Animated => "animated",
-            StickerPayload::Downgraded => "downgraded",
         }
     }
 }
@@ -279,6 +290,34 @@ mod tests {
             )
             .expect("编码 PNG");
         bytes
+    }
+
+    /// A plain picture must go out as `sub_type: 0` with its bytes verbatim:
+    /// QQ renders `sub_type: 1` as a sticker, and a generated picture is a
+    /// photo the group should be able to save and forward as one.
+    #[test]
+    fn plain_image_frame_is_sub_type_zero_and_verbatim() {
+        let bytes = png(48, 48);
+        let msg = SendGroupMsg::image("100", &bytes).expect("小图应当能发");
+        let frame = msg.to_frame("e1");
+        assert_eq!(frame["params"]["message"][0]["type"], "image");
+        assert_eq!(frame["params"]["message"][0]["data"]["sub_type"], 0);
+        let sent = msg.sent_image_bytes().expect("有图片段");
+        assert_eq!(
+            sent,
+            crate::media::collage::base64_encode(&bytes),
+            "原样转发，不重编码"
+        );
+    }
+
+    #[test]
+    fn plain_image_refuses_empty_but_not_size() {
+        assert!(SendGroupMsg::image("100", &[]).is_none());
+        // Incident nail (2026-11-11): a generated picture of ~1 MB was
+        // refused by the borrowed sticker cap and never even attempted.
+        // Sends have no size cap; this must build.
+        let huge = vec![0xFFu8; STICKER_MAX_BASE64_BYTES];
+        assert!(SendGroupMsg::image("100", &huge).is_some());
     }
 
     /// A sticker must go out as `sub_type: 1`, otherwise QQ renders a plain picture.
@@ -431,11 +470,11 @@ mod tests {
         out
     }
 
-    /// An animation too large to send untouched degrades to its first frame
-    /// rather than failing the send, and says so.
+    /// An animation goes out byte for byte at any size: sends have no
+    /// size cap (2026-11-11), so the old still-frame downgrade is gone.
     #[test]
-    fn an_oversized_animation_falls_back_to_a_still_frame() {
-        // Raw budget: base64 adds a third, so anything past 3/4 of the cap overflows.
+    fn an_oversized_animation_goes_out_verbatim() {
+        // Big enough that its base64 form passes the old sticker cap.
         let huge = padded_gif(STICKER_MAX_BASE64_BYTES / 4 * 3 + 4096);
         let encoded_len = crate::media::collage::base64_encode(&huge).len();
         assert!(
@@ -443,13 +482,12 @@ mod tests {
             "素材不够大：base64 {encoded_len} <= {STICKER_MAX_BASE64_BYTES}"
         );
         let (msg, kind) =
-            SendGroupMsg::sticker_tracked("100", &huge, None).expect("应当回落而不是失败");
-        assert_eq!(kind, StickerPayload::Downgraded);
+            SendGroupMsg::sticker_tracked("100", &huge, None).expect("应当原样发而不是失败");
+        assert_eq!(kind, StickerPayload::Animated);
         let payload = msg.sent_image_bytes().expect("图片段存在");
-        assert!(payload.len() <= STICKER_MAX_BASE64_BYTES);
-        // The fallback re-encodes JPEG, so the frame starts with SOI, never GIF.
+        assert_eq!(payload, crate::media::collage::base64_encode(&huge));
         let bytes = decode_base64(&payload);
-        assert_eq!(&bytes[..2], &[0xFF, 0xD8], "回落帧应当是 JPEG");
+        assert_eq!(&bytes[..4], b"GIF8", "原样转发应当还是 GIF");
     }
 
     #[test]

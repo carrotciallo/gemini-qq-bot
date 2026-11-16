@@ -23,6 +23,10 @@
 #   AGY_MODEL            agy 会话使用的模型（默认 agy 自身默认）
 #   AGY_PROJECTS_DIR     每群 agy 项目目录的根
 #   STICKER_DIR          表情库文件目录（空 = 禁用表情库）
+#   IMAGEGEN_DIR         生图产物目录（默认 /data/imagegen）
+#   IMAGEGEN_AGY_BIN     生图专用 agy 二进制（默认 /data/agy-img-bin/agy）
+#   IMAGEGEN_AGY_HOME    生图专用 agy home（默认 /data/agy-img-home）
+#   PERSONA_DIR          bot 设定图与文字设定卡目录（默认 /data/persona）
 #   MIHOMO_ENABLED       是否由 bot 托管 mihomo 代理（出口选择用），及
 #   MIHOMO_BIN / MIHOMO_CONFIG_PATH  其二进制与配置路径
 # 本文件路径由 GEMINI_BOT_CONFIG 环境变量指定。

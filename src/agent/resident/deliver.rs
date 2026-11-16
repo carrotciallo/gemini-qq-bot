@@ -65,6 +65,7 @@ impl ResidentSession {
         floor: &DeliveryFloor,
     ) -> Result<DeliverReceipt, ResidentError> {
         let receipt = self.confirm_delivery(text, timeout, floor).await?;
+        self.inner.lock().await.last_progress = Instant::now();
         push_audit(
             &self.audit,
             format!(
@@ -160,6 +161,12 @@ impl ResidentSession {
 
     /// Write the prompt as a single bracketed paste, chunked at char boundaries.
     pub(super) async fn write_prompt(&self, text: &str) -> Result<(), ResidentError> {
+        // A new input starts a new observation window. Startup/previous-turn
+        // ready markers cannot acknowledge this generation or its cancellation.
+        if let Ok(mut screen) = self.screen.lock() {
+            screen.clear();
+        }
+        self.inner.lock().await.last_progress = Instant::now();
         self.write_raw(PASTE_OPEN).await?;
         for range in chunk_bounds(text, PASTE_CHUNK_CHARS) {
             self.write_raw(text[range].as_bytes()).await?;

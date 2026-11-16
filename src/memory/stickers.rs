@@ -279,16 +279,17 @@ pub const STRONG_MATCH_SCORE: f64 = 1.2;
 /// a missing offer costs the chance to react at all.
 pub const OFFER_MIN_SCORE: f64 = 0.25;
 
-/// Multiplier applied to a candidate this group already saw recently, in
-/// both places candidates are ranked: the server-side preselection
-/// (`select_sticker_offers`) and `sticker_search`.
-///
-/// A soft penalty, deliberately not a filter: the sticker stays selectable when it is
-/// the only thing that fits, but it no longer wins just for being familiar. The user
-/// explicitly rejected a hard "same sticker 30 minutes" cool-down. Strengthened
-/// from a half to a quarter on 2026-11-01: at a half, sends still concentrated
-/// on a few favourites (top sticker 13% of a week's sends).
-pub const RECENT_SEND_DAMPING: f64 = 0.25;
+/// A6 (2026-11-13) frequency divisor: a candidate's rank score after
+/// dividing by how often this group already sent it inside the recent
+/// window. A fixed multiplier lost twice (a half, then a quarter) because a
+/// strong match simply eats it; the divisor grows with the sticker's own
+/// send count, so the more a favourite is used the harder it has to win —
+/// and it recovers gradually as newer sends push its old ones out of the
+/// window, instead of snapping back at full strength the day a cooldown
+/// lapses. `1 + count` keeps a never-sent sticker at its true score.
+pub fn divide_by_usage(raw: f64, sends_in_window: i64) -> f64 {
+    raw / (1.0 + sends_in_window.max(0) as f64)
+}
 
 /// Human-readable match tier for a score; `None` below [`SEARCH_MIN_SCORE`].
 pub fn match_tier(score: f64) -> Option<&'static str> {
@@ -438,6 +439,14 @@ mod tests {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
         );
         assert_ne!(a, hash_bytes(b"sticker2"));
+    }
+
+    #[test]
+    fn divide_by_usage_scales_with_the_send_count() {
+        assert_eq!(divide_by_usage(2.0, 0), 2.0);
+        assert_eq!(divide_by_usage(2.0, 1), 1.0);
+        assert_eq!(divide_by_usage(2.0, 3), 0.5);
+        assert_eq!(divide_by_usage(2.0, -2), 2.0);
     }
 
     #[test]

@@ -26,9 +26,36 @@ impl SqliteStore {
         let rows = sqlx::query(
             "SELECT memory_ref, bot_id, group_id, subject_user_id, content, kind,
                     source_message_ids, confidence, revision, origin, archived_at,
-                    created_at, updated_at
+                    created_at, updated_at, slot, tags, expires_at, state, superseded_by, state_changed_at
              FROM memories WHERE bot_id = ? AND group_id = ? AND archived_at IS NULL
              ORDER BY updated_at DESC, memory_ref DESC LIMIT ?",
+        )
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(map_memory).collect())
+    }
+
+    /// Closed memories (superseded or retired), most recently closed first.
+    ///
+    /// This is the tombstone index for compaction (memfix [mf-2]): rows the
+    /// agent itself replaced or voided, fed back as structural "do not
+    /// resurrect" markers. Archived rows are operator housekeeping and are
+    /// deliberately not tombstones.
+    pub async fn list_memory_tombstones(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        limit: i64,
+    ) -> BotResult<Vec<MemoryRecord>> {
+        let rows = sqlx::query(
+            "SELECT memory_ref, bot_id, group_id, subject_user_id, content, kind,
+                    source_message_ids, confidence, revision, origin, archived_at,
+                    created_at, updated_at, slot, tags, expires_at, state, superseded_by, state_changed_at
+             FROM memories WHERE bot_id = ? AND group_id = ? AND state IN ('superseded', 'retired')
+             ORDER BY state_changed_at DESC, memory_ref DESC LIMIT ?",
         )
         .bind(bot_id)
         .bind(group_id)
@@ -52,7 +79,7 @@ impl SqliteStore {
         let rows = sqlx::query(
             "SELECT memory_ref, bot_id, group_id, subject_user_id, content, kind,
                     source_message_ids, confidence, revision, origin, archived_at,
-                    created_at, updated_at
+                    created_at, updated_at, slot, tags, expires_at, state, superseded_by, state_changed_at
              FROM memories WHERE bot_id = ? AND group_id = ?
              ORDER BY updated_at DESC, memory_ref DESC LIMIT ? OFFSET ?",
         )
@@ -127,7 +154,7 @@ impl SqliteStore {
         let row = sqlx::query(
             "SELECT memory_ref, bot_id, group_id, subject_user_id, content, kind,
                     source_message_ids, confidence, revision, origin, archived_at,
-                    created_at, updated_at
+                    created_at, updated_at, slot, tags, expires_at, state, superseded_by, state_changed_at
              FROM memories WHERE bot_id = ? AND group_id = ? AND memory_ref = ?",
         )
         .bind(bot_id)
@@ -156,13 +183,48 @@ impl SqliteStore {
         origin: &str,
         now: i64,
     ) -> BotResult<String> {
+        self.insert_memory_v1(
+            bot_id,
+            group_id,
+            subject_user_id,
+            content,
+            kind,
+            source_message_ids,
+            confidence,
+            origin,
+            &crate::memory::schema::MemoryV1Fields::default(),
+            now,
+        )
+        .await
+    }
+
+    /// Insert a memory with its schema v1 fields attached.
+    ///
+    /// The expiry is materialised here, once: an explicit ttl wins, otherwise the
+    /// kind default applies (topics 48h, events 7d, everything else permanent).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_memory_v1(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        subject_user_id: Option<&str>,
+        content: &str,
+        kind: &str,
+        source_message_ids: &str,
+        confidence: f64,
+        origin: &str,
+        v1: &crate::memory::schema::MemoryV1Fields,
+        now: i64,
+    ) -> BotResult<String> {
         let mut tx = self.pool.begin().await?;
         let memory_ref = format!("mem_{}", uuid_like());
+        let expires_at = v1.expires_at(kind, now);
         sqlx::query(
             "INSERT INTO memories
                 (memory_ref, bot_id, group_id, subject_user_id, content, kind,
-                 source_message_ids, confidence, revision, origin, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                 source_message_ids, confidence, revision, origin, created_at, updated_at,
+                 slot, tags, expires_at, state, state_changed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'active', ?)",
         )
         .bind(&memory_ref)
         .bind(bot_id)
@@ -174,6 +236,10 @@ impl SqliteStore {
         .bind(confidence)
         .bind(origin)
         .bind(now)
+        .bind(now)
+        .bind(&v1.slot)
+        .bind(crate::memory::schema::tags_column(&v1.tags))
+        .bind(expires_at)
         .bind(now)
         .execute(&mut *tx)
         .await?;
@@ -254,6 +320,30 @@ impl SqliteStore {
         origin: Option<&str>,
         now: i64,
     ) -> BotResult<bool> {
+        self.update_memory_v1(
+            bot_id, group_id, memory_ref, content, confidence, origin, None, now,
+        )
+        .await
+    }
+
+    /// [`Self::update_memory_with_origin`] plus optional schema v1 fields.
+    ///
+    /// When `v1` is present the row's slot/tags are replaced and its expiry is
+    /// rematerialised from the ttl (explicit, else the row kind's default) at
+    /// `now`: an update is a fresh endorsement, so the clock restarts. When it is
+    /// absent the v1 columns are left exactly as they were.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_memory_v1(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        memory_ref: &str,
+        content: &str,
+        confidence: f64,
+        origin: Option<&str>,
+        v1: Option<&crate::memory::schema::MemoryV1Fields>,
+        now: i64,
+    ) -> BotResult<bool> {
         let mut tx = self.pool.begin().await?;
         let archived: Option<Option<i64>> = sqlx::query_scalar(
             "SELECT archived_at FROM memories
@@ -311,6 +401,29 @@ impl SqliteStore {
             .execute(&mut *tx)
             .await?;
         }
+        if let Some(fields) = v1 {
+            let kind: String = sqlx::query_scalar(
+                "SELECT kind FROM memories
+                 WHERE bot_id = ? AND group_id = ? AND memory_ref = ?",
+            )
+            .bind(bot_id)
+            .bind(group_id)
+            .bind(memory_ref)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE memories SET slot = ?, tags = ?, expires_at = ?
+                 WHERE bot_id = ? AND group_id = ? AND memory_ref = ?",
+            )
+            .bind(&fields.slot)
+            .bind(crate::memory::schema::tags_column(&fields.tags))
+            .bind(fields.expires_at(&kind, now))
+            .bind(bot_id)
+            .bind(group_id)
+            .bind(memory_ref)
+            .execute(&mut *tx)
+            .await?;
+        }
         // The audit actor is the writer that just touched the row, not its original
         // provenance: a correction logged under `hy3_extract` would hide the fact that
         // the agent endorsed it.
@@ -319,6 +432,146 @@ impl SqliteStore {
             &mut tx,
             crate::store::origin::audit_actor(actor),
             "memory.update",
+            bot_id,
+            group_id,
+            now,
+        )
+        .await?;
+        bump_revision(&mut tx, bot_id, group_id, now).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Replace a memory with a corrected successor (memfix [mf-1], Zep-style
+    /// invalidation): the old row closes as `superseded` with a pointer to the
+    /// new row, which carries the lineage revision + 1. Nothing is rewritten
+    /// in place and nothing is deleted, so the correction chain stays
+    /// auditable.
+    ///
+    /// Subject and kind are inherited from the old row; `v1` is the caller's
+    /// already-merged schema v1 field set for the successor. Returns the new
+    /// ref, `Ok(None)` when the target does not exist, and
+    /// [`BotError::MemoryArchived`] when it is already retired — the same
+    /// refusal contract as [`Self::update_memory_v1`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn supersede_memory(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        target_ref: &str,
+        content: &str,
+        confidence: f64,
+        origin: &str,
+        v1: &crate::memory::schema::MemoryV1Fields,
+        source_message_ids: &str,
+        now: i64,
+    ) -> BotResult<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+        let old = sqlx::query(
+            "SELECT subject_user_id, kind, revision, archived_at FROM memories
+             WHERE bot_id = ? AND group_id = ? AND memory_ref = ?",
+        )
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(target_ref)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(old) = old else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let archived_at: Option<i64> = old.get("archived_at");
+        if archived_at.is_some() {
+            tx.rollback().await?;
+            return Err(crate::error::BotError::MemoryArchived(
+                target_ref.to_string(),
+            ));
+        }
+        let subject_user_id: Option<String> = old.get("subject_user_id");
+        let kind: String = old.get("kind");
+        let revision: i64 = old.get("revision");
+        let new_ref = format!("mem_{}", uuid_like());
+        let expires_at = v1.expires_at(&kind, now);
+        sqlx::query(
+            "INSERT INTO memories
+                (memory_ref, bot_id, group_id, subject_user_id, content, kind,
+                 source_message_ids, confidence, revision, origin, created_at, updated_at,
+                 slot, tags, expires_at, state, state_changed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+        )
+        .bind(&new_ref)
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(subject_user_id.as_deref())
+        .bind(content)
+        .bind(&kind)
+        .bind(source_message_ids)
+        .bind(confidence)
+        .bind(revision + 1)
+        .bind(origin)
+        .bind(now)
+        .bind(now)
+        .bind(&v1.slot)
+        .bind(crate::memory::schema::tags_column(&v1.tags))
+        .bind(expires_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE memories SET state = 'superseded', superseded_by = ?,
+                    archived_at = ?, state_changed_at = ?, updated_at = ?
+             WHERE bot_id = ? AND group_id = ? AND memory_ref = ? AND archived_at IS NULL",
+        )
+        .bind(&new_ref)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(target_ref)
+        .execute(&mut *tx)
+        .await?;
+        let actor = crate::store::origin::audit_actor(origin);
+        audit_memory(&mut tx, actor, "memory.create", bot_id, group_id, now).await?;
+        audit_memory(&mut tx, actor, "memory.supersede", bot_id, group_id, now).await?;
+        bump_revision(&mut tx, bot_id, group_id, now).await?;
+        tx.commit().await?;
+        Ok(Some(new_ref))
+    }
+
+    /// Retire a memory (memfix [mf-1]): the row closes as `retired` — out of
+    /// every read path, but kept for audit and panel restore. False when the
+    /// row is missing or already retired.
+    pub async fn retire_memory(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        memory_ref: &str,
+        origin: &str,
+        now: i64,
+    ) -> BotResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query(
+            "UPDATE memories SET state = 'retired', archived_at = ?,
+                    state_changed_at = ?, updated_at = ?
+             WHERE bot_id = ? AND group_id = ? AND memory_ref = ? AND archived_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(memory_ref)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        audit_memory(
+            &mut tx,
+            crate::store::origin::audit_actor(origin),
+            "memory.retire",
             bot_id,
             group_id,
             now,
@@ -448,9 +701,11 @@ impl SqliteStore {
     ) -> BotResult<bool> {
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
-            "UPDATE memories SET archived_at = ?, revision = revision + 1
+            "UPDATE memories SET archived_at = ?, revision = revision + 1,
+                    state = 'archived', state_changed_at = ?
              WHERE bot_id = ? AND group_id = ? AND memory_ref = ? AND archived_at IS NULL",
         )
+        .bind(now)
         .bind(now)
         .bind(bot_id)
         .bind(group_id)
@@ -473,6 +728,42 @@ impl SqliteStore {
         bump_revision(&mut tx, bot_id, group_id, now).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Retire every active row whose v1 expiry has passed at `now`.
+    ///
+    /// Panel-written rows are exempt: an operator's own note does not silently
+    /// age out from under them. Retirement is the same one-way flag as
+    /// [`Self::archive_memory`] and lands in the same state (`archived`), so
+    /// the state/archived_at invariant (`active` ⟺ not archived) holds for
+    /// every row the sweep touches; the caller writes the summary audit
+    /// (`memory.expire.g….n…`), so this method only counts.
+    pub async fn archive_expired_memories(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        now: i64,
+    ) -> BotResult<usize> {
+        let mut tx = self.pool.begin().await?;
+        let res = sqlx::query(
+            "UPDATE memories SET archived_at = ?, revision = revision + 1,
+                    state = 'archived', state_changed_at = ?
+             WHERE bot_id = ? AND group_id = ? AND archived_at IS NULL
+               AND expires_at IS NOT NULL AND expires_at <= ? AND origin != 'panel'",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let count = res.rows_affected() as usize;
+        if count > 0 {
+            bump_revision(&mut tx, bot_id, group_id, now).await?;
+        }
+        tx.commit().await?;
+        Ok(count)
     }
 
     pub async fn memory_revision(&self, bot_id: &str, group_id: &str) -> BotResult<i64> {

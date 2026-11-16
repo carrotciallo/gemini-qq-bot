@@ -8,6 +8,66 @@ impl TurnExecutor {
     /// [`TurnResult`] so the scheduler can decide whether to continue the lane.
     pub async fn run_batch(&self, job: &BatchJob) -> TurnResult {
         let turn_started = std::time::Instant::now();
+        let deadline = turn_started
+            + std::time::Duration::from_secs(self.resident_limits.hard_cap_s.max(1) as u64);
+        // Register insertion ownership before the claim await: cancellation can
+        // race a successful SQLite commit before its returned ids are observed.
+        let mut insert_batches = Vec::new();
+        let result = match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.run_batch_inner(job, turn_started, &mut insert_batches),
+        )
+        .await
+        {
+            Ok(result) if std::time::Instant::now() < deadline => result,
+            _ => {
+                self.expire_round(job, &insert_batches).await;
+                TurnResult::AgentFailed
+            }
+        };
+        // Every return is terminal for an opening, even an inactive group or a
+        // failed preparation. Human inputs keep their existing retry policy.
+        // On cleanup failure the persisted source still excludes intake replay;
+        // startup recovery removes the remaining synthetic row.
+        if job.spontaneous.is_some() {
+            let _ = self.store.cancel_spontaneous_events(&job.event_ids).await;
+        }
+        result
+    }
+
+    pub(super) async fn expire_round(&self, job: &BatchJob, insert_batches: &[String]) {
+        // Settlement is deliberately outside the work budget. Never abandon a
+        // DB transaction or process reap merely to report a shorter latency.
+        self.resident.abort(&job.group_id).await;
+        if self
+            .store
+            .expire_turn(
+                &self.bot_id,
+                &job.group_id,
+                &job.batch_id,
+                &job.event_ids,
+                insert_batches,
+                crate::now_unix(),
+            )
+            .await
+            .is_err()
+        {
+            tracing::error!(group_id = %job.group_id, "deadline settlement failed; startup reconciliation required");
+        }
+        self.resident
+            .note_respawn_failure(&job.group_id, crate::now_unix())
+            .await;
+        self.resident
+            .audit(&job.group_id, "resident.turn.deadline")
+            .await;
+    }
+
+    async fn run_batch_inner(
+        &self,
+        job: &BatchJob,
+        turn_started: std::time::Instant,
+        insert_batches: &mut Vec<String>,
+    ) -> TurnResult {
         let now = crate::now_unix();
 
         // 1. The group may have been disabled while the batch waited.
@@ -90,8 +150,15 @@ impl TurnExecutor {
             return TurnResult::DeferredProxy;
         }
         let result = self
-            .run_resident_batch(job, &group, now, turn_started)
+            .run_resident_batch(job, &group, now, turn_started, insert_batches)
             .await;
+        // Close whichever input generation this batch last confirmed. An older
+        // completion must never disarm a different batch's replacement arm.
+        if let Ok(Some(arm)) = self.store.armed_turn(&job.group_id).await
+            && arm.batch_id == job.batch_id
+        {
+            let _ = self.store.disarm_turn(&job.group_id, &arm.turn_token).await;
+        }
         // A consumed batch ends any run of prompt rejections for the
         // group: the refused material has left the pool, so the next
         // refusal starts a fresh count instead of dropping a batch that
@@ -159,12 +226,18 @@ impl TurnExecutor {
     }
 
     /// Why a turn's answer was unusable. The preview is a flattened head of the
-    /// raw contract text the session produced. It stays in the audit and is never
-    /// handed back to the model.
+    /// redacted contract text the session produced. Filtering precedes truncation
+    /// so a cut cannot leave a credential fragment without its marker.
     pub(super) async fn audit_bad_output(&self, group_id: &str, detail: &str, preview: &str) {
         let now = crate::now_unix();
-        let kind = crate::agent::agy::output_preview(detail, 160);
-        let text = crate::agent::agy::output_preview(preview, 80);
+        let kind = crate::agent::agy::output_preview(
+            &crate::agent::segments::filter_secrets(detail, &self.secrets),
+            160,
+        );
+        let text = crate::agent::agy::output_preview(
+            &crate::agent::segments::filter_secrets(preview, &self.secrets),
+            80,
+        );
         let _ = self
             .store
             .audit(

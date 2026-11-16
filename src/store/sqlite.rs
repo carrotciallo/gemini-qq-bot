@@ -9,9 +9,9 @@ use sqlx::{Row, SqlitePool};
 use crate::error::{BotError, BotResult};
 use crate::store::{
     AgentCall, ArmedTurn, AuditEvent, CallState, CompactionJob, GroupMessageRecord, GroupRecord,
-    GroupStateRecord, HandoverRecord, JobState, MemberRecord, MemoryChunkRecord, MemoryRecord,
-    OutboxRecord, OutboxState, PendingEventRow, SeedQuarantine, StickerRecord, SummaryRecord,
-    TurnSubmission,
+    GroupStateRecord, HandoverRecord, ImageJob, ImagegenSettings, JobState, MemberRecord,
+    MemoryChunkRecord, MemoryRecord, OutboxRecord, OutboxState, PendingEventRow, SealedTopic,
+    SeedQuarantine, StickerRecord, SummaryRecord, TurnSubmission,
 };
 
 /// Every sticker column in one place so the four read paths cannot drift apart.
@@ -27,12 +27,14 @@ mod audit;
 mod calls;
 mod continuity;
 mod groups;
+mod imagegen;
 mod jobs;
 mod maps;
 mod memory;
 mod messages;
 mod outbox;
 mod pending;
+mod sealed;
 mod stickers;
 mod submit;
 

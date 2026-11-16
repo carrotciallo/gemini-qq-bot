@@ -89,14 +89,14 @@ pub(super) fn salvage_reply_parts(parts: Vec<String>, report: &mut SalvageReport
     let max_parts = crate::agent::segments::MAX_REPLY_PARTS;
     let mut out: Vec<String> = Vec::new();
     let mut budget = MAX_REPLY_CHARS;
+    let reasons = reply_part_rejections(&parts[..parts.len().min(max_parts)]);
     for (idx, part) in parts.into_iter().enumerate() {
         if idx >= max_parts {
             report.note("reply_parts", "too_many");
             continue;
         }
-        if contains_forbidden_markup(&part) {
-            // The safety rule is not downgraded: a part carrying markup is gone.
-            report.note("reply_parts", "forbidden");
+        if let Some(reason) = reasons[idx] {
+            report.note("reply_parts", reason);
             continue;
         }
         let chars = part.chars().count();
@@ -111,7 +111,27 @@ pub(super) fn salvage_reply_parts(parts: Vec<String>, report: &mut SalvageReport
             report.clamped += 1;
         }
     }
-    out
+    // Clamping or dropping a part may expose a new acknowledgement/contract
+    // fragment. Recheck exactly what will survive, with the same policy.
+    loop {
+        let reasons = reply_part_rejections(&out);
+        if reasons.iter().all(Option::is_none) {
+            return out;
+        }
+        // Each pass removes at least one of at most MAX_REPLY_PARTS entries.
+        out = out
+            .into_iter()
+            .zip(reasons)
+            .filter_map(|(part, reason)| {
+                if let Some(reason) = reason {
+                    report.note("reply_parts", reason);
+                    None
+                } else {
+                    Some(part)
+                }
+            })
+            .collect();
+    }
 }
 
 pub(super) fn salvage_stickers(
@@ -230,6 +250,17 @@ pub(super) fn lenient_op_raw(value: &Value, report: &mut SalvageReport) -> Memor
         },
         confidence,
         memory_ref: lenient_string(value.get("memory_ref")),
+        slot: lenient_string(value.get("slot")),
+        tags: match value.get("tags") {
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| lenient_string(Some(item)))
+                    .collect(),
+            ),
+            _ => None,
+        },
+        ttl: lenient_string(value.get("ttl")),
     }
 }
 

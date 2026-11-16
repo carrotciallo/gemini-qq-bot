@@ -139,7 +139,7 @@ pub struct MoodUpdateRaw {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryOpRaw {
-    /// `add` or `update`.
+    /// `add`, `update` or `retire`.
     #[serde(default)]
     pub op: Option<String>,
     #[serde(default)]
@@ -155,6 +155,15 @@ pub struct MemoryOpRaw {
     /// Required for `update`: the `memory_ref` alias handed to the model.
     #[serde(default)]
     pub memory_ref: Option<String>,
+    /// Schema v1 predicate label (optional; sanitised, never a rejection reason).
+    #[serde(default)]
+    pub slot: Option<String>,
+    /// Schema v1 clustering labels (optional).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Schema v1 lifetime: `permanent` / `30d` / `7d` / `48h` (optional).
+    #[serde(default)]
+    pub ttl: Option<String>,
 }
 
 /// A validated mood update.
@@ -175,6 +184,12 @@ pub struct MemoryOp {
     pub source_refs: Vec<String>,
     pub confidence: f64,
     pub memory_ref: Option<String>,
+    /// Schema v1 predicate label after sanitising; `None` when absent or invalid.
+    pub slot: Option<String>,
+    /// Schema v1 clustering labels after sanitising (possibly empty).
+    pub tags: Vec<String>,
+    /// Schema v1 lifetime after parsing; `None` means the kind default.
+    pub ttl: Option<crate::memory::schema::Ttl>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +197,9 @@ pub struct MemoryOp {
 pub enum MemoryOpKind {
     Add,
     Update,
+    /// Retire a row that no longer holds (memfix [mf-1]): a state transition
+    /// to `retired`, never a hard delete — the row stays for audit/restore.
+    Retire,
 }
 
 /// One validated sticker action.
@@ -287,6 +305,12 @@ pub enum RejectReason {
     TooManyOps,
     /// A poke asked for with `should_reply: false` — a poke *is* a reply action.
     PokeWithoutReply,
+    /// A group-level memory add whose text leans on an unnamed authority
+    /// （主人 / 管理员 / 群主）: the claim can never be attributed later.
+    DanglingAuthority,
+    /// An add/update about a topic the operator has sealed for this group
+    /// ([seal-2]): the topic is dead and must not be (re)written.
+    SealedTopic,
 }
 
 impl RejectReason {
@@ -304,6 +328,8 @@ impl RejectReason {
             RejectReason::MissingTarget => "missing_target",
             RejectReason::TooManyOps => "too_many_ops",
             RejectReason::PokeWithoutReply => "poke_without_reply",
+            RejectReason::DanglingAuthority => "dangling_authority",
+            RejectReason::SealedTopic => "sealed_topic",
         }
     }
 }
@@ -388,6 +414,10 @@ pub struct ValidationScope {
     /// anything else is dropped, which is what keeps a confused model from
     /// sending a picture out of the library by guessing.
     pub sticker_hashes: Vec<String>,
+    /// The group's sealed topics ([seal-2]), loaded by the caller from the
+    /// store. Adds and updates hitting one are dropped: the operator has
+    /// declared the topic dead for this group.
+    pub sealed_topics: Vec<crate::store::SealedTopic>,
 }
 
 /// Result of a validation pass.
@@ -433,15 +463,21 @@ pub fn validate_value(value: &Value, scope: &ValidationScope) -> Result<Validate
     if reply_parts.len() > crate::agent::segments::MAX_REPLY_PARTS || reply_chars > MAX_REPLY_CHARS
     {
         rejections.push(RejectReason::TooLong);
-        return finish(AgentOutput::silent(), rejections);
+        return Ok(Validated {
+            output: AgentOutput::silent(),
+            rejections,
+        });
     }
 
-    if reply_parts
+    if reply_part_rejections(&reply_parts)
         .iter()
-        .any(|part| contains_forbidden_markup(part))
+        .any(Option::is_some)
     {
         rejections.push(RejectReason::Forbidden);
-        return finish(AgentOutput::silent(), rejections);
+        return Ok(Validated {
+            output: AgentOutput::silent(),
+            rejections,
+        });
     }
 
     let sticker_ops = validate_sticker_ops(
@@ -555,8 +591,8 @@ pub fn validate_value(value: &Value, scope: &ValidationScope) -> Result<Validate
         }
     };
 
-    finish(
-        AgentOutput {
+    Ok(Validated {
+        output: AgentOutput {
             should_reply,
             reply_text,
             reply_parts,
@@ -570,7 +606,7 @@ pub fn validate_value(value: &Value, scope: &ValidationScope) -> Result<Validate
             poke_ref,
         },
         rejections,
-    )
+    })
 }
 
 /// Salvaged validation: the same per-section rules as [`validate_value`], but
@@ -657,23 +693,25 @@ pub fn validate_with_salvage(
     let quote_ref = salvage_quote_ref(value.get("quote_ref"), scope, &mut report);
     let poke_ref = salvage_poke_ref(value.get("poke_ref"), scope, should_reply, &mut report);
 
-    finish(
-        AgentOutput {
-            should_reply,
-            reply_text,
-            reply_parts,
-            nicknames,
-            mood_update,
-            topic_state,
-            memory_ops,
-            sticker_ops,
-            quote_ref,
-            part_quotes,
-            poke_ref,
+    Ok((
+        Validated {
+            output: AgentOutput {
+                should_reply,
+                reply_text,
+                reply_parts,
+                nicknames,
+                mood_update,
+                topic_state,
+                memory_ops,
+                sticker_ops,
+                quote_ref,
+                part_quotes,
+                poke_ref,
+            },
+            rejections,
         },
-        rejections,
-    )
-    .map(|validated| (validated, report))
+        report,
+    ))
 }
 
 /// Full salvage ladder in front of one raw buffer: strict, then L1/L2 span +
@@ -707,13 +745,17 @@ pub fn validate_salvaged(
 }
 
 mod checks;
+pub(crate) use self::checks::reply_part_rejections;
 
-pub use self::checks::{contains_forbidden_markup, is_sticker_hash};
+pub use self::checks::{
+    MAX_ALIAS_CHARS, contains_forbidden_markup, is_sticker_hash, is_submission_acknowledgement,
+    reply_content_rejection,
+};
 mod lenient;
 
 use self::checks::{
-    clamp_chars, finish, looks_like_raw_id, normalize_memory_ref, sanitize_alias,
-    validate_nicknames, validate_op, validate_part_quotes, validate_sticker_ops,
+    clamp_chars, looks_like_raw_id, normalize_memory_ref, sanitize_alias, validate_nicknames,
+    validate_op, validate_part_quotes, validate_sticker_ops,
 };
 use self::lenient::{
     absorb, lenient_bool, lenient_list, lenient_nickname_raw, lenient_op_raw, lenient_reply_parts,

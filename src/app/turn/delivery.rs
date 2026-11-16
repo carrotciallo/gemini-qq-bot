@@ -90,13 +90,27 @@ impl TurnExecutor {
         gaps: &[u64],
         group_id: &str,
         batch_id: &str,
+        deadline: std::time::Instant,
     ) {
         for (index, id) in ids.iter().enumerate() {
             if index > 0 {
                 let gap = gaps.get(index - 1).copied().unwrap_or(800);
                 tokio::time::sleep(std::time::Duration::from_millis(gap)).await;
             }
-            self.deliver(id, group_id).await;
+            if std::time::Instant::now() >= deadline
+                || tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    self.deliver(id, group_id),
+                )
+                .await
+                .is_err()
+            {
+                let _ = self
+                    .store
+                    .seal_pending_outbox(&self.bot_id, group_id, batch_id, crate::now_unix())
+                    .await;
+                break;
+            }
             let sent = self
                 .store
                 .get_outbox(id)
@@ -155,38 +169,25 @@ impl TurnExecutor {
             let path = self.sticker_dir.join(format!("{hash}.jpg"));
             match tokio::fs::read(&path).await {
                 Ok(bytes) if !bytes.is_empty() => {
-                    // Which payload went out is worth knowing: an animation that had
-                    // to be downgraded to one still frame is otherwise invisible.
-                    let Some((msg, payload)) = crate::onebot::action::SendGroupMsg::sticker_tracked(
-                        group_id,
-                        &bytes,
-                        row.quote_message_id.as_deref(),
-                    ) else {
+                    let Some((msg, _payload)) =
+                        crate::onebot::action::SendGroupMsg::sticker_tracked(
+                            group_id,
+                            &bytes,
+                            row.quote_message_id.as_deref(),
+                        )
+                    else {
                         let _ = self
                             .outbox
                             .finish(
                                 outbox_id,
                                 &DeliveryResult::Unknown {
-                                    detail: format!("sticker-too-large:{hash}"),
+                                    detail: format!("sticker-unbuildable:{hash}"),
                                 },
                                 crate::now_unix(),
                             )
                             .await;
                         return;
                     };
-                    if payload == crate::onebot::action::StickerPayload::Downgraded {
-                        let short: String = hash.chars().take(8).collect();
-                        let _ = self
-                            .store
-                            .audit(
-                                "system",
-                                &format!("sticker.send.downgraded.h{short}"),
-                                Some(&self.bot_id),
-                                Some(group_id),
-                                crate::now_unix(),
-                            )
-                            .await;
-                    }
                     msg
                 }
                 // The file vanished or is empty: the picture cannot be sent, and
@@ -205,6 +206,40 @@ impl TurnExecutor {
                     return;
                 }
             }
+        } else if row.kind == "image" {
+            // A generated picture: `text` holds the bare file name under the
+            // imagegen output directory. Anything that is not a bare file
+            // name is refused outright — the row must never become a path
+            // traversal into arbitrary files.
+            let name = row.text.as_str();
+            let valid_name = !name.is_empty()
+                && !name.contains('/')
+                && !name.contains('\\')
+                && !name.contains("..");
+            let bytes = if valid_name {
+                tokio::fs::read(self.imagegen_dir.join(name))
+                    .await
+                    .ok()
+                    .filter(|b| !b.is_empty())
+            } else {
+                None
+            };
+            match bytes.and_then(|b| crate::onebot::action::SendGroupMsg::image(group_id, &b)) {
+                Some(msg) => msg,
+                None => {
+                    let _ = self
+                        .outbox
+                        .finish(
+                            outbox_id,
+                            &DeliveryResult::Unknown {
+                                detail: format!("image-bytes-missing:{name}"),
+                            },
+                            crate::now_unix(),
+                        )
+                        .await;
+                    return;
+                }
+            }
         } else {
             match row.quote_message_id.as_deref() {
                 Some(target) => {
@@ -213,13 +248,18 @@ impl TurnExecutor {
                 None => crate::onebot::action::SendGroupMsg::text(group_id, &row.text),
             }
         };
+        // A picture frame carries ~1 MB of base64 the OneBot side uploads
+        // to QQ before it can answer; the first production image send blew
+        // the 10 s text budget and landed `unknown` (2026-11-11). Pictures
+        // get the longer budget, text keeps the tight one.
+        let send_timeout = if row.kind == "image" {
+            std::time::Duration::from_secs(45)
+        } else {
+            std::time::Duration::from_secs(10)
+        };
         let outcome = self
             .connection
-            .call(
-                "send_group_msg",
-                frame.params(),
-                std::time::Duration::from_secs(10),
-            )
+            .call("send_group_msg", frame.params(), send_timeout)
             .await;
         let result = crate::pipeline::outbox::classify(outcome);
         let _ = self
@@ -232,6 +272,8 @@ impl TurnExecutor {
                 .unwrap_or_else(|| format!("bot:{outbox_id}"));
             let text = if row.kind == "sticker" {
                 "[表情]".to_string()
+            } else if row.kind == "image" {
+                "[图片]".to_string()
             } else {
                 row.text.clone()
             };
@@ -279,11 +321,17 @@ impl TurnExecutor {
         Vec<crate::store::MemoryRecord>,
         Vec<crate::store::MemberRecord>,
     ) {
-        let memories = self
+        let mut memories = self
             .store
             .list_memories(&self.bot_id, group_id, 500)
             .await
             .unwrap_or_default();
+        // Sealed topics ([seal-4]): legacy rows that predate write-side
+        // enforcement must not reach the prompt through retrieval.
+        match self.store.list_sealed_topics(&self.bot_id, group_id).await {
+            Ok(sealed) => crate::memory::sealed::retain_unsealed(&mut memories, &sealed),
+            Err(_) => memories.clear(),
+        }
         let members = self
             .store
             .list_members(&self.bot_id, group_id)

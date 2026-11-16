@@ -97,12 +97,11 @@ pub(super) fn validate_nicknames(
             rejections.push(RejectReason::UnknownRef);
             continue;
         }
+        // `sanitize_alias` already truncated to `MAX_ALIAS_CHARS` and trimmed, so the
+        // only outcome left to check is emptiness. A "too long" branch here used to
+        // sit after the truncation and could never fire.
         let alias = sanitize_alias(nick.alias.unwrap_or_default());
         if alias.is_empty() {
-            continue;
-        }
-        if alias.chars().count() > 16 {
-            rejections.push(RejectReason::TooLong);
             continue;
         }
         out.push(NicknameProposal { subject_ref, alias });
@@ -110,10 +109,15 @@ pub(super) fn validate_nicknames(
     out
 }
 
+/// Longest alias kept: a display name, not a description.
+pub const MAX_ALIAS_CHARS: usize = 16;
+
+/// Normalise a proposed alias: drop control characters, then truncate to
+/// [`MAX_ALIAS_CHARS`] characters, then trim the ends.
 pub(super) fn sanitize_alias(raw: String) -> String {
     raw.chars()
         .filter(|ch| !ch.is_control() && !matches!(ch, '\u{2028}' | '\u{2029}' | '\u{feff}'))
-        .take(16)
+        .take(MAX_ALIAS_CHARS)
         .collect::<String>()
         .trim()
         .to_string()
@@ -154,13 +158,6 @@ pub(super) fn validate_part_quotes(
     out
 }
 
-pub(super) fn finish(
-    output: AgentOutput,
-    rejections: Rejections,
-) -> Result<Validated, RejectReason> {
-    Ok(Validated { output, rejections })
-}
-
 impl AgentOutput {
     pub(super) fn silent() -> Self {
         Self {
@@ -187,7 +184,9 @@ pub(super) fn validate_op(
     let kind_op = match op.op.as_deref() {
         Some("add") => MemoryOpKind::Add,
         Some("update") => MemoryOpKind::Update,
-        // `delete` and anything else is forbidden: only the panel may delete.
+        Some("retire") => MemoryOpKind::Retire,
+        // Hard `delete` and anything else is forbidden: retirement is a state
+        // transition (see `retire`); only the panel may actually delete.
         Some(_) => {
             rejections.push(RejectReason::Forbidden);
             return None;
@@ -277,7 +276,7 @@ pub(super) fn validate_op(
             }
             None
         }
-        MemoryOpKind::Update => match op.memory_ref {
+        MemoryOpKind::Update | MemoryOpKind::Retire => match op.memory_ref {
             None => {
                 rejections.push(RejectReason::MissingTarget);
                 return None;
@@ -296,6 +295,47 @@ pub(super) fn validate_op(
         },
     };
 
+    // A group-level add (no subject) whose text leans on an unnamed
+    // authority — 主人 / 管理员 / 群主 said or decided something — files a
+    // claim nobody can attribute later. 2026-11-12 audit: an unnamed
+    // 「管理员」 exemption sat in one group's memory while the words were
+    // actually the owner's, and the bot argued about whose it was for
+    // nine days. Naming the person at write time is cheap; do it there.
+    if matches!(kind_op, MemoryOpKind::Add)
+        && subject_ref.is_none()
+        && ["主人", "管理员", "群主"]
+            .iter()
+            .any(|w| content.contains(w))
+    {
+        rejections.push(RejectReason::DanglingAuthority);
+        return None;
+    }
+
+    // Sealed topics ([seal-2]): the operator has declared this topic dead
+    // for the group, so it may not be (re)written — neither as a fresh add
+    // nor smuggled into an update's replacement text. The applier repeats
+    // the check at the store door for callers that skip validation.
+    if matches!(kind_op, MemoryOpKind::Add | MemoryOpKind::Update)
+        && crate::memory::sealed::hit(
+            &scope.sealed_topics,
+            op.slot.as_deref().unwrap_or_default(),
+            &content,
+        )
+        .is_some()
+    {
+        rejections.push(RejectReason::SealedTopic);
+        return None;
+    }
+
+    // The v1 fields are optional metadata: sanitise them, never reject over them.
+    let (slot, tags) = crate::memory::schema::sanitize_slot_tags(
+        op.slot.as_deref().unwrap_or_default(),
+        &op.tags.unwrap_or_default(),
+    );
+    let ttl = op
+        .ttl
+        .as_deref()
+        .and_then(crate::memory::schema::Ttl::parse);
     Some(MemoryOp {
         op: kind_op,
         subject_ref,
@@ -304,6 +344,9 @@ pub(super) fn validate_op(
         source_refs,
         confidence,
         memory_ref,
+        slot: if slot.is_empty() { None } else { Some(slot) },
+        tags,
+        ttl,
     })
 }
 
@@ -321,6 +364,181 @@ pub fn contains_forbidden_markup(text: &str) -> bool {
         "[at:",
     ];
     FORBIDDEN.iter().any(|needle| text.contains(needle))
+}
+
+/// One outbound content policy, shared by strict validation, partial salvage,
+/// plain-text rescue and delayed captions. Return only a reason code, never text.
+pub fn reply_content_rejection(text: &str) -> Option<&'static str> {
+    let normalized = normalize_reply_screen(text);
+    let lower = normalized.to_ascii_lowercase();
+    if contains_forbidden_markup(&lower) {
+        return Some("forbidden");
+    }
+    const CONTRACT_MARKERS: &[&str] = &[
+        "should_reply",
+        "reply_parts",
+        "reply_text",
+        "memory_ops",
+        "sticker_ops",
+        "nicknames",
+        "quote_ref",
+        "quote_echo",
+        "mood_update",
+        "topic_update",
+        "poke_ref",
+        "turn_token",
+        "call_mcp_tool",
+    ];
+    if CONTRACT_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return Some("contract_marker");
+    }
+    is_submission_acknowledgement(&normalized).then_some("submission_ack")
+}
+
+/// Check individual parts first, then minimal contiguous combinations. Already
+/// rejected parts cannot cause neighboring ordinary prose to be discarded too.
+/// Callers bound the list by MAX_REPLY_PARTS before this quadratic scan.
+pub(crate) fn reply_part_rejections(parts: &[String]) -> Vec<Option<&'static str>> {
+    let mut reasons: Vec<_> = parts
+        .iter()
+        .map(|part| reply_content_rejection(part))
+        .collect();
+    for width in 2..=parts.len() {
+        for start in 0..=parts.len() - width {
+            let end = start + width;
+            let joined = parts[start..end].concat();
+            // Include fragments and badges surrounding a pure acknowledgement,
+            // even if a shorter subspan was already rejected. Unlike phrase
+            // matching, the vocabulary check cannot absorb ordinary prose.
+            if is_acknowledgement_by_composition(&joined) {
+                reasons[start..end].fill(Some("submission_ack"));
+                continue;
+            }
+            if reasons[start..end].iter().any(Option::is_some) {
+                continue;
+            }
+            if let Some(reason) = reply_content_rejection(&joined) {
+                reasons[start..end].fill(Some(reason));
+            }
+        }
+    }
+    reasons
+}
+
+fn normalize_reply_screen(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{200b}'
+                        | '\u{200c}'
+                        | '\u{200d}'
+                        | '\u{2060}'
+                        | '\u{feff}'
+                        | '\u{fe0e}'
+                        | '\u{fe0f}'
+                )
+        })
+        .collect()
+}
+
+/// The agent narrating its own submission machinery — "已提交本轮回复。",
+/// "已记录本轮提交" — is not a chat reply. `本轮` (this turn) is contract
+/// vocabulary that group chat never uses, so the screen keys on the turn
+/// word paired with a submission verb, plus the bare acknowledgement forms
+/// and the tool's own name. Ordinary chat that merely mentions handing
+/// something in does not trip it.
+///
+/// The phrase shapes alone leaked twice more (2026-11-11
+/// "本轮已成功提交回复。", 2026-11-13 "回复已提交完毕。"): the narrator
+/// rewords itself around any list. So [`is_acknowledgement_by_composition`]
+/// also screens what a narration is *made of*, not just how it is phrased.
+pub fn is_submission_acknowledgement(text: &str) -> bool {
+    let core = acknowledgement_core(text);
+    let t = core.as_str();
+    const BARE: [&str; 3] = ["已提交", "已记录", "提交完成"];
+    if BARE.contains(&t) || t.contains("submit_reply") {
+        return true;
+    }
+    if (t.contains("本轮回复") || t.contains("本轮提交"))
+        && (t.contains("提交") || t.contains("记录") || t.contains("发送"))
+    {
+        return true;
+    }
+    is_acknowledgement_by_composition(t)
+}
+
+fn acknowledgement_core(text: &str) -> String {
+    let normalized = normalize_reply_screen(text);
+    // A finite decoration set, not arbitrary emoji stripping: ordinary prose
+    // retains its words, while simple acknowledgement badges cannot hide it.
+    let t = normalized.trim_matches(|c: char| {
+        c.is_whitespace()
+            || c.is_ascii_punctuation()
+            || matches!(
+                c,
+                '。' | '！'
+                    | '？'
+                    | '～'
+                    | '，'
+                    | '、'
+                    | '；'
+                    | '：'
+                    | '“'
+                    | '”'
+                    | '「'
+                    | '」'
+                    | '✅'
+                    | '✔'
+                    | '☑'
+                    | '👍'
+                    | '👌'
+                    | '📨'
+                    | '📤'
+                    | '📩'
+                    | '✉'
+                    | '💬'
+            )
+    });
+    t.to_owned()
+}
+
+/// Composition screen for submission narration: after dropping sentence
+/// punctuation, a short text (at most 16 chars) built *only* from the
+/// narration vocabulary, carrying at least one submission verb
+/// (提交/发送/记录) and at least one object-or-completion marker
+/// (回复/已/完毕/完成/成功), is the agent talking to the system in some
+/// word order — never a chat reply. Real prose about handing something
+/// in always carries words outside the vocabulary （作业/老师/一下…),
+/// which is what keeps it deliverable.
+fn is_acknowledgement_by_composition(text: &str) -> bool {
+    const VOCABULARY: &str = "本轮回复提交发送记录已成功完毕完成更新";
+    let normalized = acknowledgement_core(text);
+    let core: String = normalized
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '，' | '。' | '、' | '；' | '：' | '·' | '…' | '—' | ' ' | '　'
+            )
+        })
+        .collect();
+    let core = core.trim_end_matches(|c| matches!(c, '了' | '啦' | '哦' | '呢'));
+    let length = core.chars().count();
+    if length == 0 || length > 16 {
+        return false;
+    }
+    if !core.chars().all(|c| VOCABULARY.contains(c)) {
+        return false;
+    }
+    let has_verb = core.contains("提交") || core.contains("发送") || core.contains("记录");
+    let has_marker = core.contains("回复")
+        || core.contains("已")
+        || core.contains("完毕")
+        || core.contains("完成")
+        || core.contains("成功");
+    has_verb && has_marker
 }
 
 /// A raw QQ id (all digits, 5..=20 long) appearing where an alias belongs means the

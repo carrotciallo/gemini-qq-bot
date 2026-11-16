@@ -159,6 +159,11 @@ pub struct Intake {
     /// `None` in tests that do not arm marks: released batches then simply
     /// merge into later ones, as before the replay existed.
     resident: Option<Arc<crate::app::resident::ResidentManager>>,
+    /// The executor's per-group annex cache, after the same lifecycle rule:
+    /// the previous batch of a conversation that no longer exists is not a
+    /// context worth keeping. `None` in tests that never build an executor.
+    previous_batch:
+        Option<Arc<tokio::sync::Mutex<HashMap<String, crate::app::turn::history::PreviousBatch>>>>,
     /// The conversation-shape layer: one person and the bot trading messages.
     ///
     /// Not optional on purpose. A group with nothing to damp is at `L0`, which makes
@@ -227,6 +232,7 @@ impl Intake {
             digest: None,
             pacing: None,
             resident: None,
+            previous_batch: None,
             damper: crate::app::damper::Damper::new(),
             running_turns: None,
             connection: None,
@@ -275,6 +281,30 @@ impl Intake {
         self
     }
 
+    /// Number of per-group rows the intake holds in memory.
+    ///
+    /// Only for tests: these caches are the intake's whole memory of a group,
+    /// so one number is enough to prove a departed group leaves none.
+    #[cfg(test)]
+    pub fn transient_group_rows(&self) -> usize {
+        fn len<K, V, S>(map: &std::sync::Mutex<std::collections::HashMap<K, V, S>>) -> usize {
+            map.lock().map(|map| map.len()).unwrap_or(0)
+        }
+        len(&self.pace)
+            + len(&self.last_cadence)
+            + len(&self.budget_marks)
+            + len(&self.damper_wait_marks)
+            + len(&self.relevance_cache)
+            + len(&self.ambient_claims)
+            + len(&self.relevance_marks)
+            + self.flood_marks.lock().map(|set| set.len()).unwrap_or(0)
+            + self
+                .flood_backgrounds
+                .lock()
+                .map(|map| map.len())
+                .unwrap_or(0)
+    }
+
     /// Attach the in-flight turn registry. Flush skips a group that already has
     /// a turn running, so the resident insert path can claim those rows.
     pub fn with_running_turns(mut self, running: Arc<crate::app::turn::RunningTurns>) -> Self {
@@ -287,6 +317,69 @@ impl Intake {
     pub fn with_resident(mut self, resident: Arc<crate::app::resident::ResidentManager>) -> Self {
         self.resident = Some(resident);
         self
+    }
+
+    /// Attach the executor's annex cache so a departed group's previous batch
+    /// does not outlive it.
+    pub fn with_previous_batch(
+        mut self,
+        previous_batch: Arc<
+            tokio::sync::Mutex<HashMap<String, crate::app::turn::history::PreviousBatch>>,
+        >,
+    ) -> Self {
+        self.previous_batch = Some(previous_batch);
+        self
+    }
+
+    /// Forget everything held in memory about `group_id`.
+    ///
+    /// Called when the bot leaves a group. None of these tables is
+    /// authoritative — every one of them is a cache that would be rebuilt (or
+    /// just missed) after a restart — but a group that no longer exists can
+    /// never rebuild them, so without this they are the one per-group state
+    /// that grows with history instead of with the live group list.
+    ///
+    /// Ordinary session rotation deliberately does NOT call this: the respawn
+    /// ladder has to survive a rotation, or the backoff that exists to stop a
+    /// respawn storm would reset on every rotation.
+    pub(crate) async fn forget_group(&self, group_id: &str) {
+        if let Ok(mut pace) = self.pace.lock() {
+            pace.remove(group_id);
+        }
+        if let Ok(mut seen) = self.last_cadence.lock() {
+            seen.remove(group_id);
+        }
+        if let Ok(mut marks) = self.budget_marks.lock() {
+            marks.remove(group_id);
+        }
+        if let Ok(mut marks) = self.damper_wait_marks.lock() {
+            marks.retain(|(group, _), _| group != group_id);
+        }
+        if let Ok(mut cache) = self.relevance_cache.lock() {
+            cache.remove(group_id);
+        }
+        if let Ok(mut claims) = self.ambient_claims.lock() {
+            claims.remove(group_id);
+        }
+        if let Ok(mut marks) = self.relevance_marks.lock() {
+            marks.remove(group_id);
+        }
+        if let Ok(mut marks) = self.flood_marks.lock() {
+            marks.remove(group_id);
+        }
+        if let Ok(mut backgrounds) = self.flood_backgrounds.lock() {
+            backgrounds.remove(group_id);
+        }
+        if let Some(turns) = &self.running_turns {
+            turns.deregister(group_id);
+        }
+        self.damper.forget(group_id);
+        if let Some(resident) = &self.resident {
+            resident.forget_group(group_id).await;
+        }
+        if let Some(previous_batch) = &self.previous_batch {
+            previous_batch.lock().await.remove(group_id);
+        }
     }
 
     /// Consume a no-submission replay mark for this group, if one is armed
@@ -372,6 +465,7 @@ impl Intake {
             flooded: false,
             flood_background: None,
             retry: true,
+            spontaneous: None,
         };
         let rows = rows
             .into_iter()
@@ -562,6 +656,12 @@ impl Intake {
                             now,
                         )
                         .await;
+                    // The group is gone: close its PTY session and drop every
+                    // cache keyed by an id no live conversation will use again.
+                    if let Some(resident) = &self.resident {
+                        resident.close(&group_id).await;
+                    }
+                    self.forget_group(&group_id).await;
                 }
             }
             _ => {}
@@ -1336,6 +1436,7 @@ impl Intake {
                     flooded,
                     flood_background: flood_background.take(),
                     retry: false,
+                    spontaneous: None,
                 });
             }
         }

@@ -35,6 +35,12 @@ impl PromptRejections {
         Self::default()
     }
 
+    /// Number of groups still carrying a strike. Only for tests.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+
     /// Record one prompt-level rejection of `event_ids` in `group`.
     /// Returns true when the batch should be dropped: it is the second
     /// consecutive rejection and the batch still covers at least one

@@ -12,6 +12,7 @@ fn scope() -> ValidationScope {
             "a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f809".into(),
             "b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a".into(),
         ],
+        sealed_topics: Vec::new(),
     }
 }
 
@@ -432,6 +433,51 @@ fn update_requires_an_existing_memory_ref() {
 }
 
 #[test]
+fn retire_needs_a_store_key_and_delete_stays_forbidden() {
+    // A well-formed retire op validates, carrying its target ref.
+    let mut doc = ok_doc();
+    doc["memory_ops"] = serde_json::json!([{
+        "op": "retire",
+        "memory_ref": "mem:mem_abc123",
+        "content": "事情了结了",
+        "kind": "fact",
+        "source_refs": ["m1"]
+    }]);
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert_eq!(v.output.memory_ops.len(), 1);
+    assert_eq!(v.output.memory_ops[0].op, MemoryOpKind::Retire);
+    assert_eq!(
+        v.output.memory_ops[0].memory_ref.as_deref(),
+        Some("mem_abc123")
+    );
+
+    // Retire without a target is refused.
+    let mut doc = ok_doc();
+    doc["memory_ops"] = serde_json::json!([{
+        "op": "retire",
+        "content": "事情了结了",
+        "kind": "fact",
+        "source_refs": ["m1"]
+    }]);
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert!(v.output.memory_ops.is_empty());
+    assert!(v.rejections.reasons.contains(&RejectReason::MissingTarget));
+
+    // Hard delete stays forbidden even though retire exists.
+    let mut doc = ok_doc();
+    doc["memory_ops"] = serde_json::json!([{
+        "op": "delete",
+        "memory_ref": "mem:mem_abc123",
+        "content": "删掉",
+        "kind": "fact",
+        "source_refs": ["m1"]
+    }]);
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert!(v.output.memory_ops.is_empty());
+    assert!(v.rejections.reasons.contains(&RejectReason::Forbidden));
+}
+
+#[test]
 fn add_with_a_chosen_memory_ref_is_forbidden() {
     let mut doc = ok_doc();
     doc["memory_ops"][0]["memory_ref"] = serde_json::json!("mem_mine");
@@ -526,6 +572,63 @@ fn one_bad_memory_op_no_longer_kills_the_reply() {
     assert_eq!(salvaged.output.memory_ops.len(), 1);
     assert_eq!(report.layer, SalvageLayer::None);
     assert_eq!(strict.output.memory_ops.len(), 1);
+}
+
+/// [opt-2] 2026-11-12 audit guard: a group-level add that says an unnamed
+/// 主人/管理员/群主 did something can never be attributed afterwards.
+/// The same claim filed under a person — or a group claim with no
+/// authority words in it — passes.
+#[test]
+fn group_level_add_with_unnamed_authority_is_dropped() {
+    let raw = r#"{
+        "should_reply": true,
+        "reply_parts": ["在的"],
+        "memory_ops": [
+            {"op":"add","content":"管理员已经免除了检讨","kind":"fact","source_refs":["m1"]},
+            {"op":"add","subject_ref":"u1","content":"管理员已经免除了检讨","kind":"fact","source_refs":["m1"]},
+            {"op":"add","content":"群里今晚很热闹","kind":"fact","source_refs":["m2"]}
+        ]
+    }"#;
+    let v = validate(raw, &scope()).expect("文档可用");
+    assert_eq!(v.output.memory_ops.len(), 2);
+    assert!(
+        v.rejections
+            .reasons
+            .iter()
+            .any(|r| r.as_str() == "dangling_authority"),
+        "{:?}",
+        v.rejections.reasons
+    );
+}
+
+/// [seal-2] An add about a sealed topic is dropped with `sealed_topic`;
+/// an unrelated add in the same batch survives.
+#[test]
+fn sealed_topic_add_is_dropped() {
+    let mut sc = scope();
+    sc.sealed_topics = vec![crate::store::SealedTopic {
+        keywords: vec!["水泥".into()],
+        ..Default::default()
+    }];
+    let raw = r#"{
+        "should_reply": true,
+        "reply_parts": ["在的"],
+        "memory_ops": [
+            {"op":"add","content":"鱼缸又被灌了水泥","kind":"fact","source_refs":["m1"]},
+            {"op":"add","content":"今天认了一只夜鹭","kind":"fact","source_refs":["m2"]}
+        ]
+    }"#;
+    let v = validate(raw, &sc).expect("文档可用");
+    assert_eq!(v.output.memory_ops.len(), 1);
+    assert_eq!(v.output.memory_ops[0].content, "今天认了一只夜鹭");
+    assert!(
+        v.rejections
+            .reasons
+            .iter()
+            .any(|r| r.as_str() == "sealed_topic"),
+        "{:?}",
+        v.rejections.reasons
+    );
 }
 
 /// Prose around the answer is no longer fatal, and the layer is reported.
@@ -711,4 +814,238 @@ fn salvage_report_renders_audit_suffix() {
         "{}",
         report.detail()
     );
+}
+
+/// 2026-11-08, group 928: a turn's real submission was superseded by an
+/// insert, the agent trailed off with its own submission narration
+/// "已提交本轮回复。", and the salvage ladder relayed that machinery text
+/// to the group as the reply. The narration is not an answer, on any path.
+#[test]
+fn submission_acknowledgement_is_never_a_plain_text_reply() {
+    assert_eq!(
+        crate::agent::salvage::plain_text_reply("已提交本轮回复。"),
+        None
+    );
+    assert_eq!(
+        crate::agent::salvage::plain_text_reply("已记录本轮提交。"),
+        None
+    );
+    // Ordinary chat that merely mentions handing something in is prose.
+    assert!(crate::agent::salvage::plain_text_reply("作业我早提交啦，老师还没批呢").is_some());
+    assert!(crate::agent::salvage::plain_text_reply("这轮回复我给满分").is_some());
+}
+
+#[test]
+fn submission_acknowledgement_reply_text_is_forbidden() {
+    let mut doc = ok_doc();
+    doc["reply_text"] = serde_json::json!("已提交本轮回复。");
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert!(!v.output.should_reply, "提交自述不得作为回复交付");
+    assert!(v.rejections.reasons.contains(&RejectReason::Forbidden));
+}
+
+#[test]
+fn submission_acknowledgement_part_is_dropped_and_the_rest_survives() {
+    let raw = r#"{"should_reply":true,"reply_parts":["满心欢喜赶回寝室","已提交本轮回复。"],"memory_ops":"nope"}"#;
+    let (validated, report) = validate_salvaged(raw, &scope()).expect("还有话可说");
+    assert_eq!(
+        validated.output.reply_parts,
+        vec!["满心欢喜赶回寝室".to_string()]
+    );
+    assert!(validated.output.should_reply);
+    assert!(
+        report
+            .dropped
+            .iter()
+            .any(|(s, r, n)| *s == "reply_parts" && *r == "submission_ack" && *n == 1),
+        "{:?}",
+        report.dropped
+    );
+}
+
+#[test]
+fn all_parts_submission_acknowledgement_still_refuses_the_document() {
+    let raw = r#"{"should_reply":true,"reply_parts":["已提交本轮回复。"],"memory_ops":"nope"}"#;
+    assert_eq!(
+        validate_salvaged(raw, &scope()).unwrap_err(),
+        RejectReason::EmptyReply
+    );
+}
+
+/// 2026-11-11, group 928: "本轮已成功提交回复。" — the listed compounds
+/// are split by 已成功， so the phrase screen missed it. 2026-11-13,
+/// group 112: "回复已提交完毕。" — no 本轮 at all. The narrator keeps
+/// rewording itself around any phrase list; the composition screen
+/// (short, built only from narration vocabulary, carrying a submission
+/// verb and a completion/object marker) catches every word order, while
+/// prose that merely mentions handing something in keeps its outside
+/// words and stays deliverable.
+fn assert_delivery_matrix(parts: &[&str], allowed: bool) {
+    let joined = parts.join("\n");
+    for document in [
+        serde_json::json!({"should_reply":true, "reply_parts":parts}),
+        serde_json::json!({"should_reply":true, "reply_text":joined}),
+    ] {
+        let strict = validate_value(&document, &scope()).expect("structural validity");
+        assert_eq!(strict.output.should_reply, allowed, "strict {parts:?}");
+        let lenient = validate_with_salvage(&document, &scope(), SalvageLayer::Partial);
+        assert_eq!(
+            lenient.is_ok_and(|(v, _)| v.output.should_reply),
+            allowed,
+            "lenient {parts:?}"
+        );
+    }
+    assert_eq!(
+        crate::agent::salvage::plain_text_reply(&joined).is_some(),
+        allowed,
+        "plain {parts:?}"
+    );
+}
+
+#[test]
+fn shared_delivery_screen_split_acknowledgements() {
+    for parts in [
+        vec!["回复", "提交"],
+        vec!["回", "复", "已", "提交"],
+        vec!["should_", "reply: true"],
+    ] {
+        assert_delivery_matrix(&parts, false);
+    }
+    let doc = serde_json::json!({"should_reply":true, "reply_parts":["今晚吃面", "回复", "提交"]});
+    assert!(
+        !validate_value(&doc, &scope())
+            .expect("strict")
+            .output
+            .should_reply
+    );
+    let (v, report) =
+        validate_with_salvage(&doc, &scope(), SalvageLayer::Partial).expect("partial");
+    assert_eq!(v.output.reply_parts, vec!["今晚吃面"]);
+    assert!(!report.dropped.is_empty());
+}
+
+#[test]
+fn shared_delivery_screen_ack_decoration_and_zero_width() {
+    for text in [
+        "回复已提交✅",
+        "回复已提交。👍",
+        "回复\u{200b}已提交",
+        "> 回复已提交完毕。",
+        "已发送✔️",
+    ] {
+        assert_delivery_matrix(&[text], false);
+    }
+}
+
+#[test]
+fn shared_delivery_screen_contract_fields() {
+    for text in [
+        "should_reply: true",
+        "reply_parts 为空",
+        "turn_token 是本轮口令",
+        "memory_ops: []",
+        "poke_ref: u1",
+    ] {
+        assert_delivery_matrix(&[text], false);
+    }
+}
+
+#[test]
+fn shared_delivery_screen_forbidden_markup() {
+    for text in [
+        "你好[CQ:at,qq=all]",
+        "你好[cQ:at,qq=all]",
+        "通知@全体成员",
+        "你好<@123456>",
+    ] {
+        assert_delivery_matrix(&[text], false);
+    }
+    assert_delivery_matrix(&["你好[C", "Q:at,qq=all]"], false);
+}
+
+#[test]
+fn shared_delivery_screen_preserves_homework_conversation() {
+    for text in [
+        "我把作业提交了",
+        "作业已发送给老师，等批改呢",
+        "明天提交作业别忘啦",
+        "这条回复好好笑",
+    ] {
+        assert_delivery_matrix(&[text], true);
+    }
+}
+
+#[test]
+fn shared_delivery_screen_bare_sent_is_blocked_but_context_is_not() {
+    assert_delivery_matrix(&["已发送"], false);
+    for text in [
+        "邮件已发送给老师了",
+        "已发送的文件还能撤回吗",
+        "你说的已发送是什么意思",
+    ] {
+        assert_delivery_matrix(&[text], true);
+    }
+}
+
+#[test]
+fn reworded_submission_acknowledgements_are_still_not_replies() {
+    for narration in [
+        "本轮已成功提交回复。",
+        "回复已提交完毕。",
+        "已更新本轮提交。",
+        "回复，已提交完毕。",
+    ] {
+        assert!(is_submission_acknowledgement(narration), "{narration}");
+        assert_eq!(
+            crate::agent::salvage::plain_text_reply(narration),
+            None,
+            "{narration}"
+        );
+    }
+    for prose in [
+        "我把作业提交了",
+        "更新一下记录",
+        "这条回复好好笑",
+        "记录一下今天的事",
+    ] {
+        assert!(!is_submission_acknowledgement(prose), "{prose}");
+        assert!(
+            crate::agent::salvage::plain_text_reply(prose).is_some(),
+            "{prose}"
+        );
+    }
+}
+
+#[test]
+fn alias_longer_than_the_cap_is_truncated_not_rejected() {
+    // 16 chars is the ceiling; 17 must be shortened, never dropped with `TooLong`
+    // (that branch sat behind the truncation and could not fire).
+    let long: String = "猫".repeat(17);
+    let mut doc = ok_doc();
+    doc["nicknames"] = serde_json::json!([{"subject_ref": "u1", "alias": long}]);
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert_eq!(v.output.nicknames.len(), 1, "截断后仍应保留昵称");
+    assert_eq!(v.output.nicknames[0].alias.chars().count(), MAX_ALIAS_CHARS);
+    assert!(
+        !v.rejections.reasons.contains(&RejectReason::TooLong),
+        "截断不是拒绝"
+    );
+}
+
+#[test]
+fn alias_of_exactly_the_cap_is_kept_whole() {
+    let exact: String = "猫".repeat(MAX_ALIAS_CHARS);
+    let mut doc = ok_doc();
+    doc["nicknames"] = serde_json::json!([{"subject_ref": "u1", "alias": exact}]);
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert_eq!(v.output.nicknames.len(), 1);
+    assert_eq!(v.output.nicknames[0].alias, exact);
+}
+
+#[test]
+fn alias_that_is_only_control_chars_is_dropped() {
+    let mut doc = ok_doc();
+    doc["nicknames"] = serde_json::json!([{"subject_ref": "u1", "alias": "\u{7}\u{feff}"}]);
+    let v = validate_value(&doc, &scope()).expect("通过校验");
+    assert!(v.output.nicknames.is_empty(), "净空后的别名不落库");
 }

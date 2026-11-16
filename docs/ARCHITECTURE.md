@@ -1,4 +1,45 @@
-# 架构说明（基线 8539f0a）
+# 架构说明：当前入口与历史快照
+
+## 当前入口（2026-11-16，R22）
+
+以下索引以审计基线 `93275e2` 加 R1–R21 已合并代码为准，不声称已部署。
+后面的 `8539f0a` 全文是历史资料，旧行号、表数、只读 MCP、审计名及已删列
+仅描述那个提交；不要从历史配置表生成当前配置。当前配置以
+[`config.example.toml`](../config.example.toml) 和 [`src/config.rs`](../src/config.rs) 为准。
+
+| 当前边界 | 源码入口与保证/限制 |
+|---|---|
+| 入站与调度 | [`src/app/intake.rs`](../src/app/intake.rs)、[`src/pipeline/scheduler.rs`](../src/pipeline/scheduler.rs)：群内串行、认领实际返回的 pending ids；自发任务持久化 source，不与人类批次合并。 |
+| 正式输出 | [`src/mcp/submit.rs`](../src/mcp/submit.rs)、[`src/store/sqlite/submit.rs`](../src/store/sqlite/submit.rs)：`submit_reply` 先原子落库再 ACK；轮末取当前口令最后一份合格提交，而不是每次 MCP 调用都发群。 |
+| 插话与引用 | [`src/app/turn/resident_batch.rs`](../src/app/turn/resident_batch.rs)：插话前撤销旧口令，交付确认后才武装新一代、扩展消息/成员引用；原编号不重排，跨群输入不能获得权限。 |
+| 内容筛查 | [`src/agent/contract/checks.rs`](../src/agent/contract/checks.rs)、[`src/agent/salvage.rs`](../src/agent/salvage.rs)：严格/宽容/纯文本抢救共享 CQ、合约字段、提交自述筛查；跨段也检查。保守拒绝孤立“已发送”，不扩大为全部普通陈述禁词。 |
+| 出站持久化 | [`src/pipeline/outbox.rs`](../src/pipeline/outbox.rs)：多段入队原子化；`unknown` 不自动重发。生图 `succeeded` 指产物和发件箱已持久化，不等于 OneBot 已确认发送。 |
+| MCP 写权限 | [`src/mcp/session.rs`](../src/mcp/session.rs)、[`src/mcp/imagegen.rs`](../src/mcp/imagegen.rs)：固定环境 scope 优先于 roots；工具不只读，包含提交缓冲、表情收编及生图任务登记。生图身份由当前 armed token 的已确认消息范围验证。 |
+| 记忆与封存 | [`src/app/mod.rs`](../src/app/mod.rs)、[`src/state/memory.rs`](../src/state/memory.rs)、[`src/memory/`](../src/memory/)：折叠/压缩/摘要/交接用专用 Agy `SummaryModel`，不是可热切换的聊天 aux；记忆有 state/slot/tags/TTL，`sealed_topics` 是显式封存约束。 |
+| 生图 | [`src/app/imagegen.rs`](../src/app/imagegen.rs)：HTTP 网页 worker 主路，失败至多一次 Agy 回退。worker 本身不在仓库审计范围内。仅收明确任务路径、真实解码 JPEG/PNG、有字节/像素边界；不遍历共享 brain 猜归属。 |
+| 生图额度与取消 | [`src/store/sqlite/imagegen.rs`](../src/store/sqlite/imagegen.rs)：短事务内校验并登记额度（上海日界 15/群、5/群/人＋10分钟冷却、主人豁免）；停用/暂停后取消延迟任务，额度历史保留；在途网络请求不能撤回。 |
+| 会话与预算 | [`src/app/turn/exec.rs`](../src/app/turn/exec.rs)、[`src/agent/resident.rs`](../src/agent/resident.rs)、[`src/process/group.rs`](../src/process/group.rs)：整轮 timeout 包含准备/冷启动，取消结算与有界回收另计；Linux 所有权进程组防止只杀 leader。看门狗先观察本代语义进展，旧屏幕 marker 不作新一代确认。 |
+| 固定行为 | 自发静默 23:00–08:00、4h 最小间隔、近14天近似话题冷却；表情菜单硬排除本群最近20条已发、100条频次除数；出站戳一戳不限频。 |
+
+### 默认值与部署值不是同一事实
+
+源码默认硬顶 **90s**、软顶 **45s**，步流停滞看门狗 **120s**；本轮收到的
+生产口径是硬顶 **180s**、软顶 **90s**。R22 不读取/修改生产配置，不把口径
+当已核验的运行事实。工作超时后仍必须收尾数据库、进程和发送不确定状态，
+数据库阻塞时不能把工作预算宣传为整个函数的绝对墙钟上限。K1 零步卡死的
+若干代码侧候选已修补，但未经生产自然样本证明真正根因。
+
+### 数据库版本
+
+审计基线 `93275e2` 有 **27** 个迁移；当前增加 **0028 pending source** 和
+**0029 armed confirmed inputs**，共 **29** 个。历史 11 个迁移不是当前统计。
+升级/旧程序兼容与不可盲目 down 的说明见
+[`MIGRATION-COMPATIBILITY.md`](MIGRATION-COMPATIBILITY.md)。
+测试证据与仍未做的真实群验证见 [`TESTING.md`](TESTING.md)。
+
+---
+
+# 历史快照：8539f0a（以下内容非当前运行说明）
 
 本文描述 gemini-qq-bot 在提交 `8539f0a`（「lane halt 接上运维面」）时的实际结构与
 行为。所有结论都以该提交的代码为准，行号与常量值可直接对照源码；文档不描述计划、

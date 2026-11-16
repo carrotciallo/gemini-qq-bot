@@ -206,6 +206,43 @@ impl SqliteStore {
         }))
     }
 
+    /// The spontaneous engine's raw state blob for one group (`{}` when unset).
+    pub async fn get_spontaneous_json(&self, bot_id: &str, group_id: &str) -> BotResult<String> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT spontaneous_json FROM group_state WHERE bot_id = ? AND group_id = ?",
+        )
+        .bind(bot_id)
+        .bind(group_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(raw.unwrap_or_else(|| "{}".to_string()))
+    }
+
+    /// Store the spontaneous engine's state blob, creating the state row when
+    /// the group has none yet. Mood and topic columns are left untouched.
+    pub async fn put_spontaneous_json(
+        &self,
+        bot_id: &str,
+        group_id: &str,
+        json: &str,
+        now: i64,
+    ) -> BotResult<()> {
+        sqlx::query(
+            "INSERT INTO group_state (bot_id, group_id, spontaneous_json, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (bot_id, group_id) DO UPDATE SET
+                spontaneous_json = excluded.spontaneous_json,
+                updated_at = excluded.updated_at",
+        )
+        .bind(bot_id)
+        .bind(group_id)
+        .bind(json)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn put_state(
         &self,
         bot_id: &str,
