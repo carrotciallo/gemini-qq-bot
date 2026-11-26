@@ -1743,8 +1743,11 @@ mod tests {
             format!("#!/bin/sh\ntarget=$(printf '%s' \"$2\" | grep -o '/[^ ]*\\.jpg' | head -n 1)\ncp '{}' \"$target\"\n", fixture.display()),
         )
         .expect("写脚本");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         path
     }
 
@@ -1779,8 +1782,11 @@ mod tests {
              exec sleep 60\n",
         )
         .expect("写脚本");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         let home = dir.path().join("home");
         let out = dir.path().join("out");
         std::fs::create_dir_all(&home).expect("home");
@@ -1809,8 +1815,11 @@ mod tests {
             format!("#!/bin/sh\nsleep 12\ntarget=$(printf '%s' \"$2\" | grep -o '/[^ ]*\\.jpg' | head -n 1)\ncp '{}' \"$target\"\n", fixture.display()),
         )
         .expect("写脚本");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         let home = dir.path().join("home");
         let out = dir.path().join("out");
         std::fs::create_dir_all(&home).expect("home");
@@ -1826,8 +1835,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let bin = dir.path().join("mute-agy.sh");
         std::fs::write(&bin, "#!/bin/sh\nexit 0\n").expect("写脚本");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         let home = dir.path().join("home");
         let out = dir.path().join("out");
         std::fs::create_dir_all(&home).expect("home");
@@ -1909,8 +1921,11 @@ mod tests {
         }
         let bin = dir.path().join("unbound-agy.sh");
         std::fs::write(&bin, script).expect("script");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
         run_generation(&bin, &home, &out, &job(false), "prompt").await
     }
 

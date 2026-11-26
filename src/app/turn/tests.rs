@@ -2234,8 +2234,11 @@ async fn round_deadline_includes_cold_bootstrap() {
         .hard_cap_s = 1;
     let bin = dir.path().join("agy");
     std::fs::write(&bin, "#!/bin/sh\nexec sleep 60\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let job = claimed_job(&store, &[message("slow-bootstrap", "u1", "hello", 0)]).await;
     let started = std::time::Instant::now();
     let result =
@@ -2845,8 +2848,11 @@ async fn failed_resident_releases_coverage(reason: &str, inserted: bool) {
         "#!/bin/sh\nprintf '? for shortcuts\\n'\nexec sleep 60\n",
     )
     .expect("script");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let session = executor
@@ -3103,8 +3109,11 @@ done
         ),
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let config = crate::agent::resident::ResidentConfig {
         bin,
         home,
@@ -3304,8 +3313,11 @@ async fn check_unconfirmed_insert(mcp: bool, deadline: bool) {
         "#!/bin/sh\nprintf '? for shortcuts\\n'\nexec sleep 60\n",
     )
     .expect("script");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
     let workspace = dir.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let session = executor
