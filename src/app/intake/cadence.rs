@@ -222,105 +222,35 @@ impl Intake {
 
     /// Whether this burst is complete enough to send on.
     ///
-    /// The gate scores how unfinished the text looks; this function turns that score into
-    /// a waiting time. Splitting the two is the whole point: a finished burst (score 0)
-    /// is released on the very next tick instead of sitting out a fixed grace period,
-    /// while a half-sentence gets up to [`HOLD_MAX_SECONDS`] of patience.
+    /// Hand-over decision for a burst that is not at the ceiling.
     ///
-    /// Returns the verdict plus the gate's reason, so the caller can put the reason in the
-    /// audit trail instead of throwing it away.
+    /// There is no pacing judge any more (2026-11-24, owner's decision:
+    /// the aux gate is gone). A burst is handed over as soon as the
+    /// structural rules (damper, ceiling, budget) allow; whether the
+    /// text looks finished is her judgement inside the turn now. This
+    /// matches what production already did on ~98% of windows, where
+    /// the dead judge answered Unavailable and bought no wait at all.
+    ///
+    /// The digest preparation stays: it is the memory pipeline's
+    /// background summary for the group's next turn, launched here
+    /// because this is where a burst's arrival is first observed. It
+    /// finishes on its own budget; the turn falls back to raw entries
+    /// when none is ready.
     pub(super) async fn burst_may_hand_over(
         &self,
-        gate: &crate::app::preflight::Preflight,
         group_id: &str,
         rows: &[crate::store::PendingEventRow],
-        widest: i64,
-        now: i64,
     ) -> (bool, &'static str) {
-        let judged = self
-            .pace
-            .lock()
-            .ok()
-            .and_then(|pace| pace.get(group_id).copied());
-        let score = match judged {
-            // Something new arrived: the text changed, so the old score is stale.
-            Some((id, _, _)) if id != widest => None,
-            // Nothing new: the cached score still describes exactly this text, so only
-            // the clock has moved, and the clock is arithmetic rather than a model call.
-            Some((_, score, judged_at)) => {
-                return (now - judged_at >= score.hold_seconds(), score.reason());
+        if let Some(engine) = self.digest.clone() {
+            let messages: Vec<IncomingMessage> = rows
+                .iter()
+                .filter_map(|r| serde_json::from_str::<IncomingMessage>(&r.normalized_payload).ok())
+                .collect();
+            if !messages.is_empty() {
+                engine.prepare_background(group_id, messages);
             }
-            None => None,
-        };
-        let messages: Vec<IncomingMessage> = rows
-            .iter()
-            .filter_map(|r| serde_json::from_str::<IncomingMessage>(&r.normalized_payload).ok())
-            .collect();
-        let pending_ids: HashSet<String> = messages.iter().map(|m| m.message_id.clone()).collect();
-        let members = self
-            .store
-            .list_members(&self.bot_id, group_id)
-            .await
-            .unwrap_or_default();
-        let recent_rows = self
-            .store
-            .recent_unarchived_messages(
-                &self.bot_id,
-                group_id,
-                crate::app::preflight::PREFLIGHT_CONTEXT_MESSAGES,
-            )
-            .await
-            .unwrap_or_default();
-        let recent: Vec<(String, String)> = recent_rows
-            .into_iter()
-            .filter(|m| !pending_ids.contains(&m.message_id))
-            .map(|m| {
-                let who = if m.speaker_role == "bot" {
-                    "me".to_string()
-                } else {
-                    members
-                        .iter()
-                        .find(|mem| mem.user_id == m.sender_id)
-                        .map(|mem| mem.speaker_ref.clone())
-                        .unwrap_or_else(|| "群".to_string())
-                };
-                (who, m.text)
-            })
-            .collect();
-        let score = match score {
-            Some(score) => score,
-            None => {
-                // The digest is launched when a burst arrives, but no longer
-                // inside the gate's window: the summary model routinely needs
-                // longer than the gate can lend, and a digest abandoned at the
-                // gate's deadline helped no one (2026-10-27: 100% fallback).
-                // It finishes in the background on its own budget and stashes
-                // a slot for the group's next turn; if none is ready (or the
-                // model failed) the turn falls back to the raw entries.
-                if let Some(engine) = self.digest.clone() {
-                    engine.prepare_background(group_id, messages.clone());
-                }
-                // The damper's structure line rides along when it has one. It is context
-                // about the window, nothing more: the gate keeps its advisory role and
-                // still cannot silence anything on its own.
-                let hint = self.damper.hint(group_id);
-                gate.score_with_hint(
-                    &self.bot_id,
-                    group_id,
-                    &messages,
-                    &recent,
-                    &[],
-                    hint.as_deref(),
-                )
-                .await
-            }
-        };
-        if let Ok(mut pace) = self.pace.lock() {
-            pace.insert(group_id.to_string(), (widest, score, now));
         }
-        // A score is a statement about the text, never a hold forever: the highest score
-        // buys only [`HOLD_MAX_SECONDS`], and an unavailable gate buys nothing at all.
-        (score.hold_seconds() == 0, score.reason())
+        (true, "unavailable")
     }
 }
 

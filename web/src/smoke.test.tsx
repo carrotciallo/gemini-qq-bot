@@ -27,7 +27,20 @@ const payloads: Record<string, unknown> = {
   },
   "/api/v1/status": {
     bot_id: "2000000001",
-    health: { production_ready: true, blockers: [], aux: { ready: true, error: null } },
+    health: {
+      production_ready: true,
+      blockers: [],
+      aux: { ready: true, error: null },
+      proxy_enabled: true,
+      proxy: {
+        process_running: true,
+        api_ok: true,
+        vps_node_ok: true,
+        selected_node: "tokyo-1-tuic",
+        last_error: null,
+        restarts: 0,
+      },
+    },
     groups: 2,
     lanes: [],
     pending_messages: 0,
@@ -140,6 +153,7 @@ describe("console shell", () => {
 
     // Dashboard renders from the canned status/quota/settings.
     expect(await screen.findByText("生产就绪")).toBeTruthy();
+    expect(await screen.findByText(/tokyo-1-tuic（VPS 固定）/)).toBeTruthy();
     expect(await screen.findByText(/93\.5%/)).toBeTruthy();
 
     // Tab wiring: five tabs, tablist semantics, selected state follows.

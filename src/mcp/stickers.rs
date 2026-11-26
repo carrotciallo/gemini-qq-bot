@@ -53,7 +53,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": KEEP_TOOL,
-            "description": "决定一张表情要不要进你自己的表情库。收下就以后能发，ignore 就永远不再问你。只能用这批图片描述里给出的句柄。",
+            "description": "决定一张表情要不要进你自己的表情库。收下就以后能发，ignore 就永远不再问你。只能用这批图片里给出的句柄。收下时带上你自己写的 description，以后靠它找这张。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -65,6 +65,10 @@ pub fn tool_definitions() -> Value {
                         "type": "string",
                         "enum": ["self", "ignore"],
                         "description": "self 收进库，ignore 以后不用"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "收下时写：你给这张表情的一句短描述（30 字内），写清画的是谁、什么表情动作、图里的文字。以后检索就靠它。ignore 时不用填"
                     }
                 },
                 "required": ["hash", "verdict"]
@@ -267,9 +271,16 @@ pub async fn call_search(
 /// Answer one `sticker_keep` call.
 ///
 /// The hash must already exist in the cache. A hash she invented cannot create a row,
-/// which means she cannot add anything the tagger never saw. A recorded
+/// which means she cannot add anything she was never shown. A recorded
 /// verdict leaves an audit row (`mcp.sticker_keep.self|ignore.h…`), so the
 /// library's growth is attributable instead of inferred from row counts.
+///
+/// Since 2026-11-24 she is the one who saw the picture, so a `self` verdict
+/// may carry her own caption in `description`. The caption is written to the
+/// row (when it beats the stored one) and becomes its search text. It is
+/// also the keep-time dedup input: a caption near-verbatim to a kept row's
+/// means the shelf already has this joke, so the new row is refused as a
+/// duplicate instead of shelved twice.
 pub async fn call_keep(
     store: &SqliteStore,
     bot_id: &str,
@@ -289,6 +300,14 @@ pub async fn call_keep(
         .unwrap_or_default()
         .trim()
         .to_lowercase();
+    let caption: String = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(60)
+        .collect();
     if hash.is_empty() {
         return tool_error("hash 不能为空");
     }
@@ -299,16 +318,78 @@ pub async fn call_keep(
     };
     // The model sees an 8-char handle, so resolve a prefix to the single full hash it
     // unambiguously names. Anything ambiguous or unknown is refused rather than guessed.
-    let full = match store.sticker_by_hash(bot_id, &hash).await {
-        Ok(Some(row)) => row.hash,
+    let row = match store.sticker_by_hash(bot_id, &hash).await {
+        Ok(Some(row)) => row,
         Ok(None) => match store.find_sticker_by_prefix(bot_id, &hash).await {
-            Ok(Some(full)) => full,
-            Ok(None) => return tool_error("没有这张表情，只能用图片描述里给出的句柄"),
+            Ok(Some(full)) => match store.sticker_by_hash(bot_id, &full).await {
+                Ok(Some(row)) => row,
+                _ => return tool_error("读取表情库失败"),
+            },
+            Ok(None) => return tool_error("没有这张表情，只能用图片里给出的句柄"),
             Err(_) => return tool_error("读取表情库失败"),
         },
         Err(_) => return tool_error("读取表情库失败"),
     };
+    let full = row.hash.clone();
+    // Keep-time semantic dedup: her caption against the shelf she already
+    // owns. A near-verbatim match means this joke is already shelved, so the
+    // candidate is refused as a duplicate — the same decision the ingest
+    // gate used to make with the tagger's text, moved to the moment a
+    // caption first exists.
+    if kept == KEPT_YES && !caption.is_empty() {
+        let duplicate = store
+            .sticker_kept_descriptions(bot_id, 500)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(other, _)| other != &full)
+            .map(|(other, description)| {
+                (
+                    other,
+                    crate::memory::stickers::description_similarity(&description, &caption),
+                )
+            })
+            .filter(|(_, score)| *score >= crate::memory::stickers::SEMANTIC_DEDUP_MIN_SCORE)
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((existing, _)) = duplicate {
+            let _ = store.set_sticker_kept(bot_id, &full, KEPT_REFUSED).await;
+            let short = &full[..full.len().min(8)];
+            let existing_short = &existing[..existing.len().min(8)];
+            let _ = store
+                .audit(
+                    "agent",
+                    &format!("mcp.sticker_keep.duplicate.h{short}.of{existing_short}"),
+                    Some(bot_id),
+                    group_id,
+                    crate::now_unix(),
+                )
+                .await;
+            return json!({
+                "content": [{"type": "text", "text": format!("库里已经有一张很像的了（#{existing_short}），这张就没重复收。")}],
+                "isError": false
+            });
+        }
+    }
     let recorded = store.set_sticker_kept(bot_id, &full, kept).await;
+    // Her caption becomes the row's search text when it beats what is stored
+    // (a candidate she just saw carries none, so hers normally wins).
+    if kept == KEPT_YES
+        && matches!(recorded, Ok(true))
+        && !caption.is_empty()
+        && caption.chars().count() > row.description.chars().count()
+    {
+        let blob = crate::memory::stickers::sticker_search_blob(
+            &row.ocr,
+            &row.emotion,
+            &caption,
+            &row.scene,
+            &row.intent,
+            &row.usage_hint,
+        );
+        let _ = store
+            .set_sticker_description(bot_id, &full, &caption, &blob)
+            .await;
+    }
     if matches!(recorded, Ok(true)) {
         let short = &full[..full.len().min(8)];
         let _ = store
@@ -372,6 +453,86 @@ mod tests {
             kept: KEPT_YES,
             created_at: 0,
         }
+    }
+
+    async fn test_store(dir: &tempfile::TempDir) -> SqliteStore {
+        let pool = crate::store::migrations::open_and_migrate(&dir.path().join("bot.sqlite3"))
+            .await
+            .expect("迁移");
+        SqliteStore::new(pool)
+    }
+
+    async fn candidate(store: &SqliteStore, hash: &str, description: &str) {
+        store
+            .upsert_sticker(
+                hash,
+                "1",
+                "100",
+                "/tmp/x.jpg",
+                "sticker",
+                "other",
+                "",
+                description,
+                "",
+                description,
+                None,
+                false,
+                true,
+                1,
+            )
+            .await
+            .expect("写候选行");
+    }
+
+    #[tokio::test]
+    async fn keep_writes_her_caption_to_the_row() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = test_store(&dir).await;
+        candidate(&store, "aaaa1111bbbb2222", "").await;
+        let out = call_keep(
+            &store,
+            "1",
+            Some("100"),
+            &json!({"hash": "aaaa1111", "verdict": "self", "description": "白猫趴键盘上，一脸无奈"}),
+        )
+        .await;
+        assert_eq!(out["isError"], false, "{out}");
+        let row = store
+            .sticker_by_hash("1", "aaaa1111bbbb2222")
+            .await
+            .expect("读")
+            .expect("行还在");
+        assert_eq!(row.kept, KEPT_YES);
+        assert_eq!(row.description, "白猫趴键盘上，一脸无奈");
+        assert!(row.search_blob.contains("白猫趴键盘上"));
+    }
+
+    #[tokio::test]
+    async fn keep_with_a_near_verbatim_caption_is_refused_as_duplicate() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = test_store(&dir).await;
+        candidate(&store, "aaaa1111bbbb2222", "白猫趴键盘上，一脸无奈").await;
+        store
+            .set_sticker_kept("1", "aaaa1111bbbb2222", KEPT_YES)
+            .await
+            .expect("先收一张");
+        candidate(&store, "cccc3333dddd4444", "").await;
+        let out = call_keep(
+            &store,
+            "1",
+            Some("100"),
+            &json!({"hash": "cccc3333", "verdict": "self", "description": "白猫趴键盘上，一脸无奈"}),
+        )
+        .await;
+        assert_eq!(out["isError"], false, "{out}");
+        let text = out["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("已经有一张很像的"), "{text}");
+        let row = store
+            .sticker_by_hash("1", "cccc3333dddd4444")
+            .await
+            .expect("读")
+            .expect("行还在");
+        assert_eq!(row.kept, KEPT_REFUSED);
     }
 
     #[test]

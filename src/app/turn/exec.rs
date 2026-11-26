@@ -118,7 +118,7 @@ impl TurnExecutor {
                 .store
                 .audit(
                     "system",
-                    "agent.waiting_for_us_proxy",
+                    "agent.waiting_for_vps_proxy",
                     Some(&self.bot_id),
                     Some(&job.group_id),
                     now,

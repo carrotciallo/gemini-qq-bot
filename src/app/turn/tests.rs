@@ -7,48 +7,6 @@ struct FixtureFetcher {
     calls: AtomicUsize,
 }
 
-/// Canned describer: the image path with the network taken out.
-///
-/// It answers exactly what the real tagger would, in the same JSON shape, so the
-/// code under test is `parse_tags` + `resolve_kind` + ingest — not a test copy.
-struct CannedDescriber {
-    lines: Vec<serde_json::Value>,
-    calls: AtomicUsize,
-}
-
-impl CannedDescriber {
-    fn new(ocr: &str, description: &str) -> Self {
-        Self {
-            lines: vec![serde_json::json!({
-                "kind": "sticker",
-                "ocr": ocr,
-                "description": description,
-                "emotion": "无语",
-                "self": "other",
-                "nsfw": false,
-            })],
-            calls: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::app::preflight::ImageDescriber for CannedDescriber {
-    async fn describe(
-        &self,
-        _bot_id: &str,
-        _group_id: &str,
-        images: &[String],
-    ) -> Vec<crate::app::preflight::ImageTag> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        // Round-trip through the real parser instead of building both sides by hand:
-        // a schema drift then fails here rather than in production.
-        assert!(!images.is_empty(), "描述器只该在真的有图时被调用");
-        let payload = serde_json::json!({ "images": self.lines }).to_string();
-        crate::app::preflight::parse_tags(&payload)
-    }
-}
-
 #[async_trait::async_trait]
 impl ImageFetcher for FixtureFetcher {
     async fn fetch(
@@ -93,7 +51,7 @@ fn message(ref_id: &str, speaker: &str, text: &str, images: usize) -> IncomingMe
 }
 
 #[tokio::test]
-async fn image_bundle_is_bounded_and_never_reaches_the_agent_as_pixels() {
+async fn image_bundle_is_bounded_and_staged_as_files_for_the_agent() {
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
         8,
@@ -124,23 +82,40 @@ async fn image_bundle_is_bounded_and_never_reaches_the_agent_as_pixels() {
         }
     }
 
-    // No gate configured: nothing may be described, and no pixels may be staged.
+    let dir = tempfile::tempdir().expect("tmp");
+    let pool = crate::store::migrations::open_and_migrate(&dir.path().join("bot.sqlite3"))
+        .await
+        .expect("迁移");
+    let store = SqliteStore::new(pool);
+    let project_dir = dir.path().join("projects").join("100");
     let (images, tagged) = prepare_image_context(
         &fetcher,
         &messages,
         1024 * 1024,
         1_000_000,
-        None,
+        &store,
         "1",
-        "100",
+        &project_dir,
     )
     .await;
 
     // Five declared images, but the per-call cap is four.
     assert_eq!(fetcher.calls.load(Ordering::Relaxed), 4);
-    assert!(images.lines.is_empty());
-    assert_eq!(images.unavailable, 5);
-    assert!(tagged.is_empty());
+    // The four survivors are staged files she opens herself: every line
+    // carries an @path, and the file is really on disk.
+    assert_eq!(images.lines.len(), 4);
+    for line in &images.lines {
+        let path = line.rsplit('@').next().expect("line carries an @path");
+        assert!(
+            std::path::Path::new(path).is_file(),
+            "staged file missing for line: {line}"
+        );
+    }
+    assert_eq!(images.unavailable, 1);
+    assert_eq!(tagged.len(), 4);
+    // Unflagged pictures are staged with a sticker handle: her verdict is
+    // the gate now, so all four hashes are keepable scope.
+    assert_eq!(images.sticker_hashes.len(), 4);
 }
 
 #[test]
@@ -2450,19 +2425,18 @@ async fn executor_fixture_with_budget(
     dir: &tempfile::TempDir,
     hourly_call_budget: u32,
 ) -> (Arc<TurnExecutor>, Arc<SqliteStore>) {
-    executor_fixture_full(dir, hourly_call_budget, Vec::new(), None).await
+    executor_fixture_full(dir, hourly_call_budget, Vec::new()).await
 }
 
-/// Fixture whose image path is fully wired: bytes to serve and a describer to answer.
+/// Fixture whose image path is fully wired: bytes for the fetcher to serve.
 ///
 /// Kept separate from [`executor_fixture_with_budget`] instead of growing its
-/// signature — two dozen call sites want a fetcher that never answers and no
-/// describer at all, and only the ingest tests want either.
+/// signature — two dozen call sites want a fetcher that never answers, and
+/// only the ingest tests want one that does.
 async fn executor_fixture_full(
     dir: &tempfile::TempDir,
     hourly_call_budget: u32,
     bytes: Vec<u8>,
-    describer: Option<Arc<dyn crate::app::preflight::ImageDescriber>>,
 ) -> (Arc<TurnExecutor>, Arc<SqliteStore>) {
     let path = dir.path().join("bot.sqlite3");
     let pool = crate::store::migrations::open_and_migrate(&path)
@@ -2514,8 +2488,6 @@ async fn executor_fixture_full(
         }),
         media_max_bytes: 1_000_000,
         media_max_pixels: 1_000_000,
-        preflight: None,
-        image_describer: describer,
         hourly_call_budget,
         sticker_dir: dir.path().join("stickers"),
         imagegen_dir: dir.path().join("imagegen"),
@@ -4002,17 +3974,7 @@ async fn pictured_job(store: &SqliteStore, message: &IncomingMessage) -> BatchJo
 #[tokio::test]
 async fn a_new_picture_is_collected_without_any_agent_call() {
     let dir = tempfile::tempdir().expect("tmp");
-    let describer = Arc::new(CannedDescriber::new(
-        "不许摸鱼",
-        "白猫趴在键盘上，画风简笔，表情无奈，适合被说摸鱼时发",
-    ));
-    let (executor, store) = executor_fixture_full(
-        &dir,
-        0,
-        sticker_png(64),
-        Some(Arc::clone(&describer) as Arc<dyn crate::app::preflight::ImageDescriber>),
-    )
-    .await;
+    let (executor, store) = executor_fixture_full(&dir, 0, sticker_png(64)).await;
     let message = pictured_message("s1", "看这个", 1);
     let job = pictured_job(&store, &message).await;
 
@@ -4029,12 +3991,13 @@ async fn a_new_picture_is_collected_without_any_agent_call() {
         .expect("读");
     assert_eq!(rows.len(), 1, "rows: {rows:?}");
     assert_eq!(rows[0].kind, "sticker");
-    assert_eq!(rows[0].ocr, "不许摸鱼");
-    assert!(rows[0].description.contains("白猫趴在键盘上"));
-    assert_eq!(describer.calls.load(Ordering::Relaxed), 1);
+    // Nobody described it: she saw the picture herself this turn, and the
+    // row's text stays empty until she captions it at keep time.
+    assert_eq!(rows[0].ocr, "");
+    assert_eq!(rows[0].description, "");
     // The bytes really landed on disk next to the row.
     assert!(std::path::Path::new(&rows[0].file_path).is_file());
-    // Described, unjudged: the shelf still needs her verdict.
+    // Seen, unjudged: the shelf still needs her verdict.
     assert_eq!(rows[0].kept, crate::store::KEPT_UNJUDGED);
     assert_eq!(rows[0].seen_count, 1);
 
@@ -4051,16 +4014,7 @@ async fn a_new_picture_is_collected_without_any_agent_call() {
 #[tokio::test]
 async fn feeding_the_same_picture_again_only_bumps_the_counter() {
     let dir = tempfile::tempdir().expect("tmp");
-    let (executor, store) = executor_fixture_full(
-        &dir,
-        0,
-        sticker_png(64),
-        Some(
-            Arc::new(CannedDescriber::new("不许摸鱼", "白猫趴在键盘上，画风简笔"))
-                as Arc<dyn crate::app::preflight::ImageDescriber>,
-        ),
-    )
-    .await;
+    let (executor, store) = executor_fixture_full(&dir, 0, sticker_png(64)).await;
 
     let first = pictured_job(&store, &pictured_message("s1", "看这个", 1)).await;
     assert_eq!(

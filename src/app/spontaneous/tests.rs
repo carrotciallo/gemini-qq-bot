@@ -57,9 +57,9 @@ fn local_day_uses_shanghai_offset() {
 fn silence_threshold_stays_in_range_and_is_stable() {
     let c = cfg();
     for day in ["2026-11-09", "2026-11-10", "2026-12-01"] {
-        let t = daily_silence_threshold("900000001", day, &c);
+        let t = daily_silence_threshold("123456789", day, &c);
         assert!((45..=120).contains(&t), "{t}");
-        assert_eq!(t, daily_silence_threshold("900000001", day, &c));
+        assert_eq!(t, daily_silence_threshold("123456789", day, &c));
     }
 }
 

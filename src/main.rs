@@ -81,8 +81,8 @@ async fn health_probe() -> ExitCode {
 /// Dry-run unless `--apply` is given. The production database path is refused
 /// in code (see `memory::migrate_v1::PRODUCTION_DB_PATHS`): the intended target
 /// is always a copy, and `--apply` first writes a timestamped backup beside it.
-/// The aux gateway is configured from the same environment as the bot
-/// (`AUX_BASE_URL`, `AUX_MODEL`, `AUX_API_KEY_FILE`).
+/// The summary model is the dedicated Agy session, configured from the
+/// same environment as the bot (`AGY_BIN`, `AGY_HOME`, `AGY_MODEL`).
 async fn migrate_memories_v1() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let arg_value = |name: &str| {
@@ -114,23 +114,25 @@ async fn migrate_memories_v1() -> ExitCode {
     };
     let store = SqliteStore::new(pool);
 
-    let key_file = std::env::var("AUX_API_KEY_FILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/data/secrets/workbuddy_api_key"));
-    let mut gateway_config = gemini_qq_bot::integrations::aux_gateway::AuxGatewayConfig::new(
-        std::env::var("AUX_BASE_URL").ok(),
-        std::env::var("AUX_MODEL").ok(),
-        key_file,
-        true,
+    let model = gemini_qq_bot::integrations::agy_aux::AgyAuxClient::new(
+        gemini_qq_bot::integrations::agy_aux::AgyAuxConfig {
+            bin: std::env::var("AGY_BIN")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::path::PathBuf::from(gemini_qq_bot::config::DEFAULT_AGY_BIN)
+                }),
+            home: std::env::var("AGY_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/data/agy-home")),
+            workspace: db_path
+                .parent()
+                .map(|dir| dir.join("__migrate_aux__"))
+                .unwrap_or_else(|| std::path::PathBuf::from("__migrate_aux__")),
+            model: std::env::var("AGY_MODEL")
+                .unwrap_or_else(|_| gemini_qq_bot::config::DEFAULT_AGY_MODEL.to_string()),
+            turn_limit: 35,
+        },
     );
-    // Same env contract as the bot: production names the sticky-session
-    // header `X-Workbuddy-Session` via AUX_SESSION_HEADER.
-    if let Ok(header) = std::env::var("AUX_SESSION_HEADER") {
-        if !header.trim().is_empty() {
-            gateway_config.session_header = header;
-        }
-    }
-    let model = gemini_qq_bot::integrations::aux_gateway::AuxGatewayClient::new(gateway_config);
 
     let now = gemini_qq_bot::now_unix();
     let mut backup_path = None;
@@ -206,7 +208,6 @@ async fn main() -> ExitCode {
     tracing::info!(
         bot_id = %config.bot_id,
         proxy_enabled = config.mihomo_enabled,
-        aux_enabled = config.aux_enabled,
         image_transport_verified = gemini_qq_bot::config::image_transport_verified(),
         "启动 gemini-qq-bot"
     );

@@ -27,23 +27,27 @@ pub const MAX_EXTRACTED_CONFIDENCE: f64 = 0.8;
 /// "希腊奶蛙写青蛙长文"). 0.55 still requires most of the bigrams to agree.
 pub const NEAR_DUPLICATE_THRESHOLD: f64 = 0.55;
 
-/// The JSON object inside a possibly fenced model reply.
+/// The JSON object slice inside a possibly fenced model reply.
 ///
 /// Model replies across the memory subsystem share the fencing habit, so
-/// the slicing lives in one place instead of being copied.
-pub fn json_body(raw: &str) -> Option<Value> {
+/// the slicing lives in one place instead of being copied. The slice runs
+/// from the first `{` to the last `}` regardless of which side the fence
+/// or prose sits on: production compaction replies arrived with the
+/// object first and only a closing fence behind it (2026-11-22), which a
+/// starts-with check alone cannot save.
+pub fn json_span(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
-    let candidate = if trimmed.starts_with('{') {
-        trimmed
-    } else {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        if end <= start {
-            return None;
-        }
-        &trimmed[start..=end]
-    };
-    serde_json::from_str(candidate).ok()
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(&trimmed[start..=end])
+}
+
+/// The JSON object inside a possibly fenced model reply.
+pub fn json_body(raw: &str) -> Option<Value> {
+    serde_json::from_str(json_span(raw)?).ok()
 }
 
 /// Normalise a subject for equality checks: case and spacing carry no meaning here.
@@ -78,6 +82,20 @@ mod tests {
             "每周五晚上一起打本",
             "住在杭州喜欢喝咖啡"
         ));
+    }
+
+    #[test]
+    fn json_span_slices_fences_and_prose() {
+        let obj = "{\"a\":1}";
+        assert_eq!(json_span(obj), Some(obj));
+        assert_eq!(json_span("```json\n{\"a\":1}\n```"), Some(obj));
+        // The 2026-11-22 production shape: object first, closing fence only.
+        assert_eq!(json_span("{\"a\":1}\n```"), Some(obj));
+        assert_eq!(json_span("好的：{\"a\":1} 以上"), Some(obj));
+        assert_eq!(json_span("没有对象"), None);
+        assert_eq!(json_span("{"), None);
+        // json_body keeps working on the same shapes.
+        assert!(json_body("{\"a\":1}\n```").is_some());
     }
 
     #[test]

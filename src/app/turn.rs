@@ -25,7 +25,6 @@ use crate::agent::prompt::{PromptBatch, PromptImages, PromptMessage, render};
 use crate::agent::salvage::{self, SalvageLayer};
 use crate::app::insert::{self, InsertLimits, InsertSignals};
 use crate::app::pacing::Tier;
-use crate::app::preflight::Preflight;
 use crate::app::probes::{ProbeAction, RoundOutcome};
 use crate::error::ErrorClass;
 use crate::health::HealthRegistry;
@@ -68,20 +67,6 @@ pub struct TurnExecutor {
     pub media_fetcher: Arc<dyn ImageFetcher>,
     pub media_max_bytes: u64,
     pub media_max_pixels: u64,
-    /// The cheap gate in front of the agent. `None` disables it entirely, which is
-    /// how tests that do not care about screening run.
-    ///
-    /// The image path only asks it one thing (`describe`), through
-    /// [`crate::app::preflight::ImageDescriber`], so that path can be exercised without
-    /// a network call; the pacing side still needs the concrete type for its scores.
-    pub preflight: Option<Arc<Preflight>>,
-    /// What describes pictures for the agent.
-    ///
-    /// In production this is the same `Preflight` as above, reached through the
-    /// [`crate::app::preflight::ImageDescriber`] trait so the image path can be driven
-    /// without a network call. `None` means "no describer": pictures are then simply
-    /// unavailable to the prompt, which is the old disabled-gate behaviour.
-    pub image_describer: Option<Arc<dyn crate::app::preflight::ImageDescriber>>,
     /// Per-group cap on agent calls started per rolling hour; 0 disables it.
     ///
     /// The same fuse the intake checks before it claims a batch, re-checked here at
@@ -656,9 +641,12 @@ pub fn build_prompt_batch(
     (batch, scope)
 }
 
-/// One successfully tagged picture, ready to become a library row.
+/// One picture resolved for this batch, ready to be offered to the library gate.
 ///
-/// The bytes are kept so the caller can persist the file; they never reach the prompt.
+/// The bytes are kept so the caller can persist the file; the agent herself only
+/// ever gets an `@path` to open or a stored description, never bytes inline. The
+/// `tag` is synthetic since 2026-11-24 (kind from QQ's flag, text fields empty)
+/// unless the picture was recognised from the library, whose row fills it in.
 #[derive(Debug, Clone)]
 pub struct TaggedImage {
     pub hash: String,
@@ -669,12 +657,21 @@ pub struct TaggedImage {
     pub message_ref: String,
 }
 
-/// Download the images in this batch, shrink them, and let the gate describe them in
-/// words.
+/// Download the images in this batch and make them visible to the agent herself.
 ///
-/// The agent never receives image bytes: it gets one line of text per picture. That
-/// keeps the expensive model's context small and, more importantly, makes the picture
-/// content reusable — the same description also feeds the sticker library later.
+/// Since 2026-11-24 the agent is the vision model: instead of a gate model
+/// describing each picture into text, the picture is re-encoded, staged inside
+/// the group's project directory, and the prompt line carries the `@path` she
+/// opens herself. Two exceptions never reach her eyes:
+///
+/// * a sticker already in her library (hash hit on a kept row) renders its
+///   stored description, marked 库里已有 — no file, no second look, nothing
+///   left to decide;
+/// * a sticker she already refused gets a one-line note, so she is not asked
+///   twice.
+///
+/// An unjudged candidate is staged again: she has seen it before but has not
+/// decided, and the earlier transcript is not a place to keep a verdict in.
 ///
 /// URLs and download errors never enter the prompt or the logs.
 async fn prepare_image_context(
@@ -682,14 +679,14 @@ async fn prepare_image_context(
     messages: &[IncomingMessage],
     max_bytes: u64,
     max_pixels: u64,
-    preflight: Option<&dyn crate::app::preflight::ImageDescriber>,
+    store: &SqliteStore,
     bot_id: &str,
-    group_id: &str,
+    project_dir: &std::path::Path,
 ) -> (PromptImages, Vec<TaggedImage>) {
     let mut stats = crate::agent::prompt::ImagePrepStats::default();
-    let mut slots: Vec<(String, usize, Option<String>)> = Vec::new();
-    let mut data_urls: Vec<String> = Vec::new();
-    let mut raw_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut sticker_hashes: Vec<String> = Vec::new();
+    let mut tagged: Vec<TaggedImage> = Vec::new();
     let mut unavailable = 0usize;
     let mut photos = 0usize;
     let mut stickers = 0usize;
@@ -735,77 +732,101 @@ async fn prepare_image_context(
                 stats.prepare += 1;
                 continue;
             };
-            let Some(data_url) = crate::media::collage::fit_for_vision(&prepared.bytes) else {
-                unavailable += 1;
-                stats.fit += 1;
-                continue;
-            };
-            slots.push((message_ref.clone(), image_index, sub_type.clone()));
-            data_urls.push(data_url);
             // The library hash + stored file use the untouched source when
             // there is one (an animated GIF): the filmstrip in
-            // `prepared.bytes` is a vision-only rendering, and re-sending it
+            // `prepared.bytes` is a viewing-only rendering, and re-sending it
             // later would post a static grid instead of the animation.
-            raw_bytes.push(prepared.original.clone().unwrap_or(prepared.bytes));
+            let raw = prepared
+                .original
+                .clone()
+                .unwrap_or_else(|| prepared.bytes.clone());
+            let hash = crate::memory::stickers::hash_bytes(&raw);
+            // QQ's flag decides what this is. When the flag is absent she
+            // decides instead: the picture is staged with a handle, and her
+            // `sticker_keep` verdict is the gate a photo would fail.
+            let kind = crate::app::preflight::resolve_kind(sub_type.as_deref(), "sticker");
+            let short = &hash[..hash.len().min(8)];
+
+            if kind == "sticker" {
+                match store.sticker_by_hash(bot_id, &hash).await {
+                    Ok(Some(row)) if row.kept == crate::store::KEPT_YES => {
+                        let tag = tag_from_row(&row);
+                        lines.push(format!(
+                            "{message_ref} 的第{image_index}张图：表情 #{short}；库里已有：{}",
+                            tag.render()
+                        ));
+                        sticker_hashes.push(hash.clone());
+                        tagged.push(TaggedImage {
+                            hash,
+                            tag,
+                            bytes: raw,
+                            message_ref: message_ref.clone(),
+                        });
+                        stats.described += 1;
+                        continue;
+                    }
+                    Ok(Some(row)) if row.kept == crate::store::KEPT_REFUSED => {
+                        lines.push(format!(
+                            "{message_ref} 的第{image_index}张图：表情 #{short}（你之前说这张不用）"
+                        ));
+                        tagged.push(TaggedImage {
+                            hash,
+                            tag: tag_from_row(&row),
+                            bytes: raw,
+                            message_ref: message_ref.clone(),
+                        });
+                        stats.described += 1;
+                        continue;
+                    }
+                    // No row yet, an unjudged candidate, or a store error:
+                    // stage the picture and let her look. Showing her a
+                    // picture she turns out to know is a small waste; hiding
+                    // one she has never seen is a lost message.
+                    _ => {}
+                }
+            }
+
+            let staged = crate::media::collage::fit_for_agy(&prepared.bytes)
+                .and_then(|jpeg| stage_viewing_copy(project_dir, &hash, &jpeg));
+            match staged {
+                Some(path) => {
+                    let shown = path.to_string_lossy();
+                    if kind == "sticker" {
+                        lines.push(format!(
+                            "{message_ref} 的第{image_index}张图：表情 #{short} @{shown}"
+                        ));
+                        sticker_hashes.push(hash.clone());
+                    } else {
+                        lines.push(format!("{message_ref} 的第{image_index}张图：@{shown}"));
+                    }
+                    tagged.push(TaggedImage {
+                        hash,
+                        tag: crate::app::preflight::ImageTag {
+                            index: 0,
+                            kind,
+                            ocr: String::new(),
+                            description: String::new(),
+                            emotion: String::new(),
+                            self_ref: String::new(),
+                            nsfw: false,
+                        },
+                        bytes: raw,
+                        message_ref: message_ref.clone(),
+                    });
+                    stats.described += 1;
+                }
+                None => {
+                    unavailable += 1;
+                    stats.fit += 1;
+                }
+            }
         }
     }
 
-    if data_urls.is_empty() {
-        return (
-            PromptImages {
-                lines: Vec::new(),
-                unavailable,
-                sticker_hashes: Vec::new(),
-                stats,
-            },
-            Vec::new(),
-        );
-    }
-
-    let Some(preflight) = preflight else {
-        stats.undescribed = data_urls.len();
-        return (
-            PromptImages {
-                lines: Vec::new(),
-                unavailable: unavailable + data_urls.len(),
-                sticker_hashes: Vec::new(),
-                stats,
-            },
-            Vec::new(),
-        );
-    };
-
-    let tags = preflight.describe(bot_id, group_id, &data_urls).await;
-    let mut lines: Vec<Option<String>> = vec![None; data_urls.len()];
-    let mut described = vec![false; data_urls.len()];
-    let mut tagged: Vec<TaggedImage> = Vec::new();
-    let all_positions: Vec<usize> = (0..data_urls.len()).collect();
-    apply_image_tags(
-        tags,
-        &all_positions,
-        &slots,
-        &raw_bytes,
-        &mut described,
-        &mut lines,
-        &mut tagged,
-    );
-    // No second shot. Each picture was already its own call; a miss stays
-    // undescribed rather than holding the reply path for another round.
-    stats.described = described.iter().filter(|seen| **seen).count();
-    let undescribed = described.iter().filter(|seen| !**seen).count();
-    stats.undescribed = undescribed;
-    let lines: Vec<String> = lines.into_iter().flatten().collect();
-    // Only stickers the model actually saw become reachable hashes. A photo is
-    // conversation material, never library material.
-    let sticker_hashes: Vec<String> = tagged
-        .iter()
-        .filter(|image| image.tag.kind == "sticker")
-        .map(|image| image.hash.clone())
-        .collect();
     (
         PromptImages {
             lines,
-            unavailable: unavailable + undescribed,
+            unavailable,
             sticker_hashes,
             stats,
         },
@@ -813,67 +834,41 @@ async fn prepare_image_context(
     )
 }
 
-/// Apply one describe answer to the batch's bookkeeping.
-///
-/// `positions` maps the answer's 1-based indexes to absolute slot positions.
-#[allow(clippy::too_many_arguments)]
-fn apply_image_tags(
-    tags: Vec<crate::app::preflight::ImageTag>,
-    positions: &[usize],
-    slots: &[(String, usize, Option<String>)],
-    raw_bytes: &[Vec<u8>],
-    described: &mut [bool],
-    lines: &mut [Option<String>],
-    tagged: &mut Vec<TaggedImage>,
-) {
-    for tag in tags {
-        let Some(&position) = tag.index.checked_sub(1).and_then(|i| positions.get(i)) else {
-            continue;
-        };
-        if described[position] {
-            continue;
-        }
-        described[position] = true;
-        let (message_ref, image_index, sub_type) = &slots[position];
-        // QQ already told us whether this is a sticker (sub_type 1) or a picture (0).
-        // That flag is authoritative: it is what the sender chose in the client, so the
-        // vision model's guess at `kind` only applies when the flag is absent. Without
-        // this, a 240px sticker that the tagger calls a photo silently misses the
-        // library.
-        let mut tag = tag;
-        tag.kind = crate::app::preflight::resolve_kind(sub_type.as_deref(), &tag.kind);
-        // A sticker gets a handle so she can decide about it with `sticker_keep` in the
-        // same turn. A photo never gets one: it can never enter her library.
-        let hash = raw_bytes
-            .get(position)
-            .map(|bytes| crate::memory::stickers::hash_bytes(bytes));
-        if tag.kind == "sticker"
-            && let Some(hash) = hash.as_deref()
-        {
-            let short = &hash[..hash.len().min(8)];
-            lines[position] = Some(format!(
-                "{} 的第{}张图：表情 #{short}；{}",
-                message_ref,
-                image_index,
-                tag.render()
-            ));
+/// The tag-shaped view of a library row, so a recognised picture renders in
+/// exactly the vocabulary a fresh tag used to produce.
+fn tag_from_row(row: &crate::store::StickerRecord) -> crate::app::preflight::ImageTag {
+    crate::app::preflight::ImageTag {
+        index: 0,
+        kind: row.kind.clone(),
+        ocr: row.ocr.clone(),
+        description: if row.description.trim().is_empty() {
+            row.scene.clone()
         } else {
-            lines[position] = Some(format!(
-                "{} 的第{}张图：{}",
-                message_ref,
-                image_index,
-                tag.render()
-            ));
-        }
-        if let Some(hash) = hash {
-            tagged.push(TaggedImage {
-                hash,
-                tag,
-                bytes: raw_bytes.get(position).cloned().unwrap_or_default(),
-                message_ref: message_ref.clone(),
-            });
-        }
+            row.description.clone()
+        },
+        emotion: row.emotion.clone(),
+        self_ref: row.is_self.clone(),
+        nsfw: row.nsfw,
     }
+}
+
+/// Write the viewing copy of one picture into the group's project directory.
+///
+/// The name is content-derived, so a repost reuses the file that is already
+/// there instead of staging a second copy, and the directory grows with the
+/// number of distinct pictures, not with the number of turns.
+fn stage_viewing_copy(
+    project_dir: &std::path::Path,
+    hash: &str,
+    jpeg: &[u8],
+) -> Option<std::path::PathBuf> {
+    let dir = project_dir.join("img");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{}.jpg", &hash[..hash.len().min(16)]));
+    if !path.is_file() {
+        std::fs::write(&path, jpeg).ok()?;
+    }
+    Some(path)
 }
 
 /// Plain lines for a resident insert. No `mN` refs: those belong to the

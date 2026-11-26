@@ -25,9 +25,8 @@ use serde_json::{Value, json};
 use crate::agent::contract::{MAX_MEMORY_CONTENT_CHARS, MEMORY_KINDS};
 use crate::config::validate_decimal_id;
 use crate::health::HealthRegistry;
-use crate::integrations::aux_gateway::AuxGatewayClient;
 use crate::integrations::quota::QuotaService;
-use crate::memory::compaction::{CompactionDecision, CompactionScheduler, SummaryModel};
+use crate::memory::compaction::{CompactionDecision, CompactionScheduler};
 use crate::state::mood::{MoodState, TopicState};
 use crate::store::{ActorKind, SqliteStore};
 

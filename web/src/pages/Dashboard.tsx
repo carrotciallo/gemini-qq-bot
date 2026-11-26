@@ -45,6 +45,16 @@ export default function Dashboard() {
             <dt>代理调用总数</dt>
             <dd>{s.calls_total}</dd>
           </div>
+          <div>
+            <dt>出口节点</dt>
+            <dd>
+              {s.health.proxy?.selected_node
+                ? `${s.health.proxy.selected_node}（VPS 固定）`
+                : s.health.proxy_enabled === false
+                  ? "未启用"
+                  : "—"}
+            </dd>
+          </div>
         </dl>
         {halted.length > 0 && (
           <p role="alert" className="bad">

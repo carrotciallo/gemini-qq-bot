@@ -19,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 
 use gemini_qq_bot::agent::prompt::DEFAULT_PERSONA;
-use gemini_qq_bot::app::preflight::{ImageDescriber, ImageTag};
+
 use gemini_qq_bot::app::resident::ResidentManager;
 use gemini_qq_bot::app::turn::{ResidentLimits, RunningTurns, TurnExecutor, shared_turn_limit};
 use gemini_qq_bot::config::OutputChannel;
@@ -55,27 +55,6 @@ impl ImageFetcher for FixtureFetcher {
             bytes: self.bytes.clone(),
             content_type: "image/jpeg".into(),
         })
-    }
-}
-
-struct SilentDescriber;
-
-#[async_trait::async_trait]
-impl ImageDescriber for SilentDescriber {
-    async fn describe(&self, _bot_id: &str, _group_id: &str, images: &[String]) -> Vec<ImageTag> {
-        images
-            .iter()
-            .enumerate()
-            .map(|(index, _)| ImageTag {
-                index,
-                kind: "picture".into(),
-                ocr: String::new(),
-                description: "一张图".into(),
-                emotion: String::new(),
-                self_ref: "other".into(),
-                nsfw: false,
-            })
-            .collect()
     }
 }
 
@@ -433,8 +412,6 @@ impl Lab {
             }),
             media_max_bytes: 1_000_000,
             media_max_pixels: 1_000_000,
-            preflight: None,
-            image_describer: Some(Arc::new(SilentDescriber)),
             hourly_call_budget: 0,
             sticker_dir: dir.path().join("stickers"),
             imagegen_dir: dir.path().join("imagegen"),

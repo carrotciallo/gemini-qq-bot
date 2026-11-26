@@ -33,7 +33,7 @@ pub const BATCH_SIZE: usize = 20;
 
 /// The production database locations this tool must never touch.
 pub const PRODUCTION_DB_PATHS: &[&str] = &[
-    "/home/user/gemini-qq-bot/runtime/data/bot.sqlite3",
+    "/home/carrot/gemini-qq-bot/runtime/data/bot.sqlite3",
     "/data/bot.sqlite3",
 ];
 
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn production_paths_are_refused() {
         assert!(is_production_path(Path::new(
-            "/home/user/gemini-qq-bot/runtime/data/bot.sqlite3"
+            "/home/carrot/gemini-qq-bot/runtime/data/bot.sqlite3"
         )));
         assert!(is_production_path(Path::new("/data/bot.sqlite3")));
         assert!(!is_production_path(Path::new("/tmp/copy.sqlite3")));

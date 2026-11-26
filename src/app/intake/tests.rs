@@ -307,7 +307,7 @@ async fn a_disabled_group_accumulates_nothing_and_is_dropped_on_tick() {
         .set_group_flags(BOT, "500", Some(false), None, None, 10)
         .await
         .expect("停用");
-    let jobs = intake.flush_tick(1_000, None).await;
+    let jobs = intake.flush_tick(1_000).await;
     assert!(jobs.is_empty());
     // The tick dropped the stored body.
     assert_eq!(store.pending_count(BOT, "500").await.expect("读"), 0);
@@ -318,7 +318,7 @@ async fn a_disabled_group_accumulates_nothing_and_is_dropped_on_tick() {
 }
 
 #[tokio::test]
-async fn quiet_window_then_flush() {
+async fn burst_floor_then_flush() {
     let (intake, store, _dir) = intake().await;
     store.ensure_group(BOT, "500", 0).await.expect("建群");
     // Store with a controllable timestamp.
@@ -327,10 +327,15 @@ async fn quiet_window_then_flush() {
     assert_eq!(rows.len(), 1);
     let arrived = rows[0].received_at;
 
-    // 4s later: still inside the quiet window.
-    assert!(intake.flush_tick(arrived + 4, None).await.is_empty());
-    // 5s later: flush.
-    let jobs = intake.flush_tick(arrived + 5, None).await;
+    // Inside the burst floor the batch is never released: two messages typed
+    // back to back must land in one turn (2026-11-24: the fixed quiet window
+    // and the pacing judge are gone; the floor is the only timing rule left
+    // before the damper).
+    assert!(intake.flush_tick(arrived + 1).await.is_empty());
+    // At the floor: flush.
+    let jobs = intake
+        .flush_tick(arrived + crate::app::preflight::MIN_BURST_SECONDS)
+        .await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids.len(), 1);
 }
@@ -345,10 +350,7 @@ async fn flush_skips_a_group_whose_turn_is_already_running() {
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let arrived = rows[0].received_at;
     assert!(
-        intake
-            .flush_tick(arrived + QUIET_SECONDS, None)
-            .await
-            .is_empty(),
+        intake.flush_tick(arrived + QUIET_SECONDS).await.is_empty(),
         "flush must not claim while a turn is running"
     );
     assert_eq!(
@@ -357,12 +359,12 @@ async fn flush_skips_a_group_whose_turn_is_already_running() {
         "rows stay unclaimed for insert"
     );
     running.deregister("500");
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1);
 }
 
 #[tokio::test]
-async fn at_bot_flushes_immediately_without_a_gate() {
+async fn at_bot_flushes_after_the_burst_floor() {
     let (intake, store, _dir) = intake().await;
     let mut event = group_event("500", "7", "1", "看这个");
     event["message"] = serde_json::json!([
@@ -372,9 +374,13 @@ async fn at_bot_flushes_immediately_without_a_gate() {
     intake.handle(&event).await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let arrived = rows[0].received_at;
-    // With no gate there is nobody to judge whether the sentence is finished, so an
-    // @ is the only "send now" signal left and it is taken at once.
-    let released = intake.flush_tick(arrived, None).await;
+    // An @ is a "send now" signal, but the burst floor still applies: the
+    // batch is released on the first tick past it, privileged as addressed
+    // (2026-11-24: this is what the production cadence path always did;
+    // the old no-gate fallback that released on the arrival tick is gone).
+    let released = intake
+        .flush_tick(arrived + crate::app::preflight::MIN_BURST_SECONDS)
+        .await;
     assert_eq!(released.len(), 1);
     assert!(released[0].privileged);
 }
@@ -389,8 +395,8 @@ async fn owner_text_does_not_get_its_own_batch() {
     let arrived = rows[0].received_at;
     // Whether she answers the owner is her decision; the batcher must not split the
     // conversation just because the speaker happens to be the owner.
-    assert!(intake.flush_tick(arrived, None).await.is_empty());
-    let released = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    assert!(intake.flush_tick(arrived).await.is_empty());
+    let released = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert_eq!(released.len(), 1);
     assert!(!released[0].privileged);
 }
@@ -407,7 +413,7 @@ async fn hard_age_flushes_even_when_messages_keep_arriving() {
         .insert_pending(BOT, "500", "2", "7", arrived + 29, "{}", "[]")
         .await
         .expect("插");
-    let jobs = intake.flush_tick(arrived + 30, None).await;
+    let jobs = intake.flush_tick(arrived + 30).await;
     assert_eq!(jobs.len(), 1);
     // Both rows belong to the same batch.
     assert_eq!(jobs[0].event_ids.len(), 2);
@@ -424,8 +430,8 @@ async fn batches_are_claimed_so_a_second_tick_cannot_duplicate_them() {
     intake.handle(&event).await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let now = rows[0].received_at + QUIET_SECONDS;
-    assert_eq!(intake.flush_tick(now, None).await.len(), 1);
-    assert!(intake.flush_tick(now, None).await.is_empty());
+    assert_eq!(intake.flush_tick(now).await.len(), 1);
+    assert!(intake.flush_tick(now).await.is_empty());
 }
 
 #[tokio::test]
@@ -441,9 +447,7 @@ async fn group_order_is_fifo_within_one_group() {
     }
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let jobs = intake
-        .flush_tick(rows[0].received_at + QUIET_SECONDS, None)
-        .await;
+    let jobs = intake.flush_tick(rows[0].received_at + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids, ids);
 }
@@ -534,9 +538,7 @@ async fn the_log_keeps_the_message_after_the_batch_is_consumed() {
     ]);
     intake.handle(&event).await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
-    let batch = intake
-        .flush_tick(rows[0].received_at + QUIET_SECONDS, None)
-        .await;
+    let batch = intake.flush_tick(rows[0].received_at + QUIET_SECONDS).await;
     assert_eq!(batch.len(), 1);
     store.delete_pending(&batch[0].event_ids).await.expect("删");
     // pending_events is gone; the log must still be there.
@@ -587,9 +589,7 @@ async fn groups_are_batched_independently() {
         ]);
         intake.handle(&event).await;
     }
-    let jobs = intake
-        .flush_tick(crate::now_unix() + QUIET_SECONDS, None)
-        .await;
+    let jobs = intake.flush_tick(crate::now_unix() + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 2);
     let mut groups: Vec<&str> = jobs.iter().map(|j| j.group_id.as_str()).collect();
     groups.sort();
@@ -602,18 +602,14 @@ async fn groups_are_batched_independently() {
 #[tokio::test]
 async fn an_unavailable_gate_releases_the_burst_immediately() {
     let (intake, store, dir) = intake().await;
-    let gate = disabled_gate(&dir);
     intake.handle(&group_event("500", "7", "1", "在吗")).await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let arrived = rows[0].received_at;
     // The floor still applies: a burst is never released on the tick it arrives.
-    assert!(intake.flush_tick(arrived, Some(&gate)).await.is_empty());
+    assert!(intake.flush_tick(arrived).await.is_empty());
     // Past the floor, a broken gate is not evidence of a pause, so it lets go.
     let jobs = intake
-        .flush_tick(
-            arrived + crate::app::preflight::MIN_BURST_SECONDS,
-            Some(&gate),
-        )
+        .flush_tick(arrived + crate::app::preflight::MIN_BURST_SECONDS)
         .await;
     assert_eq!(jobs.len(), 1);
 }
@@ -660,7 +656,7 @@ async fn a_held_batch_does_not_rewrite_its_audit_row_every_tick() {
 
     // The cap is a hard hold, so every tick below is held for the same reason.
     for offset in [5, 10, 55] {
-        assert!(intake.flush_tick(arrived + offset, None).await.is_empty());
+        assert!(intake.flush_tick(arrived + offset).await.is_empty());
     }
     let rows = |events: Vec<crate::store::AuditEvent>| {
         events
@@ -673,7 +669,7 @@ async fn a_held_batch_does_not_rewrite_its_audit_row_every_tick() {
     // Past the interval the hold states itself again: one row, not one per tick.
     assert!(
         intake
-            .flush_tick(arrived + DAMPER_WAIT_AUDIT_INTERVAL_SECONDS + 10, None)
+            .flush_tick(arrived + DAMPER_WAIT_AUDIT_INTERVAL_SECONDS + 10)
             .await
             .is_empty()
     );
@@ -698,13 +694,13 @@ async fn an_exhausted_budget_defers_the_flush_and_keeps_the_batch_pending() {
         .await
         .expect("记调用");
 
-    assert!(intake.flush_tick(now, None).await.is_empty());
+    assert!(intake.flush_tick(now).await.is_empty());
     // Nothing was claimed and nothing was dropped: the batch stays pending.
     assert_eq!(store.pending_count(BOT, "500").await.expect("读"), 1);
 
     // A second tick defers again but must not audit a second row: the
     // throttle is ten minutes and no time has passed.
-    assert!(intake.flush_tick(now, None).await.is_empty());
+    assert!(intake.flush_tick(now).await.is_empty());
     let events = store.recent_audit(50).await.expect("读审计");
     let defers: Vec<&str> = events
         .iter()
@@ -724,7 +720,7 @@ async fn one_call_below_the_budget_still_flushes() {
         .start_call(BOT, "500", "b1", arrived)
         .await
         .expect("记调用");
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1);
 }
 
@@ -743,7 +739,7 @@ async fn stale_rows_drop_when_the_pool_has_fresh_ones() {
         .expect("插新");
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let fresh_id = rows[1].id;
-    let jobs = intake.flush_tick(15_000 + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(15_000 + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids, vec![fresh_id], "老行不得进批次");
     // The stale row is gone for good, not merely left unclaimed.
@@ -776,7 +772,7 @@ async fn a_fully_stale_pool_keeps_only_its_newest_segment() {
     }
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let newest_ids: Vec<i64> = rows[50..].iter().map(|r| r.id).collect();
-    let jobs = intake.flush_tick(20_000, None).await;
+    let jobs = intake.flush_tick(20_000).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids, newest_ids, "只保留最新一段");
     let events = store.recent_audit(50).await.expect("读审计");
@@ -806,7 +802,7 @@ async fn budget_truncation_claims_only_the_newest_segment() {
     }
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let newest_ids: Vec<i64> = rows[50..].iter().map(|r| r.id).collect();
-    let jobs = intake.flush_tick(50_100, None).await;
+    let jobs = intake.flush_tick(50_100).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids, newest_ids, "截断时只领最新一段");
     assert_eq!(store.pending_count(BOT, "500").await.expect("计"), 0);
@@ -840,7 +836,7 @@ async fn flood_drain_fires_only_when_no_claim_can_be_served() {
     let live_ids: Vec<i64> = rows[10..].iter().map(|r| r.id).collect();
     // Nothing can be claimed, yet the pool still drains to its live
     // tail instead of sitting at 25 behind the blown fuse.
-    let jobs = intake.flush_tick(100_100, None).await;
+    let jobs = intake.flush_tick(100_100).await;
     assert!(jobs.is_empty(), "额度烧穿时不该有领走的批次");
     let kept = store.pending_for_group(BOT, "500").await.expect("读");
     let kept_ids: Vec<i64> = kept.iter().map(|r| r.id).collect();
@@ -855,7 +851,7 @@ async fn flood_drain_fires_only_when_no_claim_can_be_served() {
     // Once the window slides past the seeded calls, the first claim is
     // exactly the live tail — and it carries the flood flag so the
     // prompt can demote the drained context to background.
-    let jobs = intake.flush_tick(103_601, None).await;
+    let jobs = intake.flush_tick(103_601).await;
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].flooded, "泄洪后的首领要带标记");
     assert_eq!(jobs[0].event_ids, live_ids);
@@ -874,7 +870,7 @@ async fn a_large_pool_with_budget_claims_normally_and_unflagged() {
             .await
             .expect("插");
     }
-    let jobs = intake.flush_tick(100_100, None).await;
+    let jobs = intake.flush_tick(100_100).await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids.len(), 25);
     assert!(!jobs[0].flooded, "有额度时不许带泄洪标记");
@@ -888,48 +884,22 @@ async fn a_large_pool_with_budget_claims_normally_and_unflagged() {
 }
 
 #[test]
-fn flood_background_resolution_fails_open() {
-    let fallback = "截断版背景".to_string();
-    // A real summary wins and is trimmed.
-    let (text, kind) = resolve_flood_background(Some("  摘要正文  ".to_string()), fallback.clone());
-    assert_eq!(text, "摘要正文");
-    assert_eq!(kind, "ok");
-    // Empty or missing summaries keep the truncated rendering.
-    let (text, kind) = resolve_flood_background(Some("   ".to_string()), fallback.clone());
-    assert_eq!(text, "截断版背景");
-    assert_eq!(kind, "fallback");
-    let (text, kind) = resolve_flood_background(None, fallback);
-    assert_eq!(text, "截断版背景");
-    assert_eq!(kind, "fallback");
-    // A rambling summary is hard-capped at the block budget.
-    let long = "长".repeat(2000);
-    let (text, kind) = resolve_flood_background(Some(long), "x".to_string());
-    assert_eq!(kind, "ok");
-    assert_eq!(text.chars().count(), FLOOD_BACKGROUND_MAX_CHARS);
-    // The truncated fallback respects the same budget.
+fn flood_background_is_the_truncated_rendering() {
+    // Since the gateway teardown the staged background is always the
+    // script-truncated rendering of the overflow.
     let many = (0..50)
         .map(|i| format!("第{i}行积压消息内容"))
         .collect::<Vec<_>>()
         .join("\n");
-    let truncated = truncate_background(&many);
-    assert!(truncated.chars().count() <= FLOOD_BACKGROUND_MAX_CHARS);
+    let text = truncate_background(&many);
+    assert!(text.chars().count() <= FLOOD_BACKGROUND_MAX_CHARS);
+    assert!(text.starts_with("第0行积压消息内容"));
+    assert_eq!(truncate_background(""), "");
 }
 
 #[tokio::test]
-async fn flood_summary_bypass_fails_open_and_rides_the_recovery_claim() {
+async fn flood_drain_stages_a_truncated_background_for_the_recovery_claim() {
     let (intake, store, _dir) = intake_with_budget(60).await;
-    // A Aux client that is present but disabled: the summary
-    // call fails immediately, so the bypass must fall open to the
-    // script-truncated rendering and say so in the audit.
-    let client = crate::integrations::aux_gateway::AuxGatewayClient::new(
-        crate::integrations::aux_gateway::AuxGatewayConfig::new(
-            None,
-            None,
-            std::path::PathBuf::from("/nonexistent-key"),
-            false,
-        ),
-    );
-    let intake = intake.with_aux(std::sync::Arc::new(client));
     for i in 0..10 {
         intake
             .handle(&group_event(
@@ -961,27 +931,11 @@ async fn flood_summary_bypass_fails_open_and_rides_the_recovery_claim() {
     }
     // The fuse is blown: nothing is claimed, but the pool drains and
     // the overflow is staged as a background.
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert!(jobs.is_empty());
-    // The summary task is async; wait for its audit row.
-    let mut saw_fallback = false;
-    for _ in 0..60 {
-        let events = store.recent_audit(50).await.expect("读审计");
-        if events
-            .iter()
-            .any(|e| e.action == "intake.flood.summary.g500.fallback")
-        {
-            saw_fallback = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    assert!(saw_fallback, "摘要旁路失败必须回落并留审计");
     // The recovery claim carries the truncated overflow as its
     // background: drained content present, live tail not duplicated.
-    let jobs = intake
-        .flush_tick(arrived + QUIET_SECONDS + 3601, None)
-        .await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS + 3601).await;
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].flooded);
     let background = jobs[0]
@@ -1037,7 +991,7 @@ async fn flood_drain_never_demotes_the_latest_addressed() {
             .expect("记调用");
     }
     let live_ids: Vec<i64> = rows[10..].iter().map(|r| r.id).collect();
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert!(jobs.is_empty());
     let kept = store.pending_for_group(BOT, "500").await.expect("读");
     let kept_ids: Vec<i64> = kept.iter().map(|r| r.id).collect();
@@ -1074,7 +1028,7 @@ async fn flood_drain_extends_back_to_an_early_addressed() {
             .await
             .expect("记调用");
     }
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert!(jobs.is_empty());
     let kept = store.pending_for_group(BOT, "500").await.expect("读");
     assert_eq!(kept.len(), 22, "活尾巴应从 @ 那条起算");
@@ -1110,7 +1064,7 @@ async fn ambient_pool_defers_at_the_ambient_cap_but_addressed_still_claims() {
             .expect("插");
     }
     // A plain pool defers on the ambient cap alone, audited as such.
-    let jobs = intake.flush_tick(arrived + 35, None).await;
+    let jobs = intake.flush_tick(arrived + 35).await;
     assert!(jobs.is_empty(), "普通池子撞普通上限要让路");
     let events = store.recent_audit(50).await.expect("读审计");
     assert!(
@@ -1130,7 +1084,7 @@ async fn ambient_pool_defers_at_the_ambient_cap_but_addressed_still_claims() {
     intake.handle(&at_event).await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let at_arrived = rows.last().map(|r| r.received_at).unwrap_or(arrived);
-    let jobs = intake.flush_tick(at_arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(at_arrived + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1, "点名池子要能动用预留额度");
     assert!(jobs[0].privileged);
     assert_eq!(jobs[0].event_ids.len(), 5);
@@ -1163,7 +1117,7 @@ async fn ambient_pool_under_the_cap_still_claims() {
             .await
             .expect("插");
     }
-    let jobs = intake.flush_tick(arrived + 35, None).await;
+    let jobs = intake.flush_tick(arrived + 35).await;
     assert_eq!(jobs.len(), 1);
     assert!(!jobs[0].privileged);
     assert_eq!(jobs[0].event_ids.len(), 3);
@@ -1181,7 +1135,7 @@ async fn calls_older_than_the_window_do_not_count_against_the_budget() {
         .start_call(BOT, "500", "b0", arrived - BUDGET_WINDOW_SECONDS - 1)
         .await
         .expect("记调用");
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1);
 }
 
@@ -1221,43 +1175,25 @@ async fn cadence_is_only_audited_when_it_changes() {
     );
 }
 
-/// A gate that is switched off always answers `Unavailable`, which is exactly the
-/// failure path these tests need: no network, no key, deterministic.
-fn disabled_gate(dir: &tempfile::TempDir) -> crate::app::preflight::Preflight {
-    let client = crate::integrations::aux_gateway::AuxGatewayClient::new(
-        crate::integrations::aux_gateway::AuxGatewayConfig::new(
-            None,
-            None,
-            dir.path().join("absent-key"),
-            false,
-        ),
-    );
-    crate::app::preflight::Preflight::new(std::sync::Arc::new(client))
-}
-
 /// The whole point of the floor: a person typing one thought as two messages must not
 /// get cut. Even a score of 0 (a picture, a finished sentence) cannot release the
 /// burst before the second message has had a chance to arrive.
 #[tokio::test]
 async fn the_floor_keeps_back_to_back_messages_in_one_batch() {
     let (intake, store, dir) = intake().await;
-    let gate = disabled_gate(&dir);
     intake
         .handle(&group_event("500", "7", "1", "我和你说个事"))
         .await;
     let arrived = store.pending_for_group(BOT, "500").await.expect("读")[0].received_at;
     // Nothing may leave inside the floor, even though this gate would answer at once.
-    assert!(intake.flush_tick(arrived, Some(&gate)).await.is_empty());
+    assert!(intake.flush_tick(arrived).await.is_empty());
     // The second message lands inside the floor and joins the same burst.
     intake
         .handle(&group_event("500", "7", "2", "是件大事"))
         .await;
-    assert!(intake.flush_tick(arrived + 1, Some(&gate)).await.is_empty());
+    assert!(intake.flush_tick(arrived + 1).await.is_empty());
     let jobs = intake
-        .flush_tick(
-            arrived + crate::app::preflight::MIN_BURST_SECONDS,
-            Some(&gate),
-        )
+        .flush_tick(arrived + crate::app::preflight::MIN_BURST_SECONDS)
         .await;
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].event_ids.len(), 2, "两句话必须落在同一批");
@@ -1294,7 +1230,7 @@ async fn t1_tightens_the_claim_count_below_the_fuse() {
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let arrived = rows.iter().map(|r| r.received_at).max().expect("40 行");
     let now = arrived + QUIET_SECONDS;
-    let jobs = intake.flush_tick(now, None).await;
+    let jobs = intake.flush_tick(now).await;
 
     let claimed: usize = jobs.iter().map(|j| j.event_ids.len()).sum();
     let limit = intake.limits().batch.max_messages;
@@ -1332,7 +1268,7 @@ async fn t2_drops_batches_below_the_privilege_floor() {
         .await;
     let arrived = store.pending_for_group(BOT, "500").await.expect("读")[0].received_at;
     let now = arrived + QUIET_SECONDS;
-    assert!(intake.flush_tick(now, None).await.is_empty());
+    assert!(intake.flush_tick(now).await.is_empty());
     // Dropped, not deferred: it never comes back.
     assert_eq!(store.pending_count(BOT, "500").await.expect("读"), 0);
     let events = store.recent_audit(50).await.expect("读审计");
@@ -1349,7 +1285,7 @@ async fn t2_drops_batches_below_the_privilege_floor() {
         .await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let at = rows[0].received_at + QUIET_SECONDS;
-    let jobs = intake.flush_tick(at, None).await;
+    let jobs = intake.flush_tick(at).await;
     assert_eq!(jobs.len(), 1, "@ 发言必须照常应答");
     assert!(jobs[0].privileged);
 }
@@ -1381,7 +1317,7 @@ async fn t3_keeps_only_the_owner_and_never_exceeds_three() {
             .await
             .expect("记");
     }
-    assert!(intake.flush_tick(now, None).await.is_empty(), "T3 三次已满");
+    assert!(intake.flush_tick(now).await.is_empty(), "T3 三次已满");
     let events = store.recent_audit(50).await.expect("读审计");
     assert!(
         events
@@ -1497,12 +1433,7 @@ async fn a_damped_batch_stays_pending_until_the_window_opens() {
     let arrived = store.pending_for_group(BOT, "500").await.expect("读")[0].received_at;
 
     // Inside the L1 quiet window: held, and the audit says which rule held it.
-    assert!(
-        intake
-            .flush_tick(arrived + QUIET_SECONDS, None)
-            .await
-            .is_empty()
-    );
+    assert!(intake.flush_tick(arrived + QUIET_SECONDS).await.is_empty());
     assert_eq!(store.pending_count(BOT, "500").await.expect("读"), 1);
     let events = store.recent_audit(50).await.expect("读审计");
     assert!(
@@ -1514,7 +1445,7 @@ async fn a_damped_batch_stays_pending_until_the_window_opens() {
 
     // Past the window the same message is claimed — nothing was dropped.
     let jobs = intake
-        .flush_tick(arrived + crate::app::damper::L1_QUIET_SECONDS, None)
+        .flush_tick(arrived + crate::app::damper::L1_QUIET_SECONDS)
         .await;
     assert_eq!(jobs.len(), 1, "jobs: {jobs:?}");
     assert_eq!(jobs[0].event_ids.len(), 1);
@@ -1541,7 +1472,7 @@ async fn l3_lets_only_addressed_batches_through() {
     // Even well past every quiet window: L3 is a hard hold, not a delay.
     assert!(
         intake
-            .flush_tick(arrived + crate::app::damper::L2_QUIET_SECONDS + 60, None)
+            .flush_tick(arrived + crate::app::damper::L2_QUIET_SECONDS + 60)
             .await
             .is_empty()
     );
@@ -1559,7 +1490,7 @@ async fn l3_lets_only_addressed_batches_through() {
         .handle(&group_event_mentioning_bot("500", PARTNER, "2", "那你说呢"))
         .await;
     let jobs = intake
-        .flush_tick(arrived + crate::app::damper::L2_QUIET_SECONDS + 61, None)
+        .flush_tick(arrived + crate::app::damper::L2_QUIET_SECONDS + 61)
         .await;
     assert_eq!(jobs.len(), 1, "jobs: {jobs:?}");
     // Both messages ride along: the hold never discarded the first one.
@@ -1589,7 +1520,7 @@ async fn the_soft_cap_holds_only_the_sender_it_names() {
         .received_at;
     assert!(
         capped_intake
-            .flush_tick(arrived + crate::app::damper::L2_QUIET_SECONDS + 60, None)
+            .flush_tick(arrived + crate::app::damper::L2_QUIET_SECONDS + 60)
             .await
             .is_empty()
     );
@@ -1614,10 +1545,7 @@ async fn the_soft_cap_holds_only_the_sender_it_names() {
         .await;
     let other_arrived = other_store.pending_for_group(BOT, "500").await.expect("读")[0].received_at;
     let jobs = other_intake
-        .flush_tick(
-            other_arrived + crate::app::damper::L2_QUIET_SECONDS + 61,
-            None,
-        )
+        .flush_tick(other_arrived + crate::app::damper::L2_QUIET_SECONDS + 61)
         .await;
     assert_eq!(jobs.len(), 1, "jobs: {jobs:?}");
 }
@@ -1648,7 +1576,7 @@ async fn an_ordinary_multi_person_chat_is_never_damped() {
         .map(|row| row.received_at)
         .max()
         .unwrap();
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert_eq!(jobs.len(), 1, "jobs: {jobs:?}");
     assert_eq!(jobs[0].event_ids.len(), 6);
     assert_eq!(intake.damper.tier("500"), crate::app::damper::Tier::L0);
@@ -1675,7 +1603,7 @@ async fn retry_mark_claims_an_exclusive_retry_job() {
     // and must not be folded into the replay.
     resident.arm_retry("500", vec![dead_id]).await;
     let arrived = rows[0].received_at;
-    let jobs = intake.flush_tick(arrived + 1, None).await;
+    let jobs = intake.flush_tick(arrived + 1).await;
     let retry_jobs: Vec<_> = jobs.iter().filter(|j| j.retry).collect();
     assert_eq!(retry_jobs.len(), 1, "exactly one replay job: {jobs:?}");
     assert_eq!(retry_jobs[0].event_ids, vec![dead_id]);
@@ -1707,7 +1635,7 @@ async fn retry_mark_for_gone_rows_is_cleared_without_a_job() {
     // The mark names a row that does not exist: it must clear quietly and
     // the live row must flow through the normal judgement untouched.
     resident.arm_retry("500", vec![999_999]).await;
-    let jobs = intake.flush_tick(arrived + QUIET_SECONDS, None).await;
+    let jobs = intake.flush_tick(arrived + QUIET_SECONDS).await;
     assert!(jobs.iter().all(|j| !j.retry), "no replay job: {jobs:?}");
     assert_eq!(jobs.len(), 1, "the live row still flushes normally");
     assert!(
@@ -1727,7 +1655,7 @@ async fn addressed_only_pace_holds_ambient_but_addressed_claims() {
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let arrived = rows[0].received_at;
     // Ambient chatter alone never becomes a turn at this tier.
-    let jobs = intake.flush_tick(arrived + 35, None).await;
+    let jobs = intake.flush_tick(arrived + 35).await;
     assert!(jobs.is_empty(), "只应答档位下 ambient 不该成轮");
     let events = store.recent_audit(50).await.expect("读审计");
     assert!(
@@ -1743,7 +1671,7 @@ async fn addressed_only_pace_holds_ambient_but_addressed_claims() {
         {"type": "text", "data": {"text": "问你个事"}}
     ]);
     intake.handle(&at_event).await;
-    let jobs = intake.flush_tick(arrived + 70, None).await;
+    let jobs = intake.flush_tick(arrived + 70).await;
     assert!(!jobs.is_empty(), "被 @ 后整窗都应被认领");
 }
 
@@ -1766,7 +1694,7 @@ async fn addressed_only_owner_and_name_call_do_not_trigger() {
         .await;
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     let arrived = rows[0].received_at;
-    let jobs = intake.flush_tick(arrived + 70, None).await;
+    let jobs = intake.flush_tick(arrived + 70).await;
     assert!(
         jobs.is_empty(),
         "只应答档位下主人发言和喊名字不该成轮: {jobs:?}"
@@ -1791,7 +1719,7 @@ async fn addressed_only_claim_keeps_only_fixed_range_context() {
     let rows = store.pending_for_group(BOT, "500").await.expect("读");
     assert_eq!(rows.len(), 14);
     let arrived = rows[0].received_at;
-    let jobs = intake.flush_tick(arrived + 70, None).await;
+    let jobs = intake.flush_tick(arrived + 70).await;
     assert_eq!(jobs.len(), 1, "被 @ 应认领一轮: {jobs:?}");
     // Fixed range: the trigger plus the ten messages above it; the
     // three oldest ambient rows are consumed, not carried.

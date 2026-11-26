@@ -130,6 +130,50 @@ impl SqliteStore {
 
     /// Rows of one group that carry visible text, newest first: the candidate set for
     /// the semantic dedup gate.
+    /// Kept rows that carry a description, newest first: the candidate set for
+    /// the keep-time semantic dedup. When she keeps a picture and captions it
+    /// herself, her caption is compared against the shelf she already owns —
+    /// a near-verbatim match means the new row would duplicate an old one.
+    pub async fn sticker_kept_descriptions(
+        &self,
+        bot_id: &str,
+        limit: i64,
+    ) -> BotResult<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT hash, description FROM stickers
+              WHERE bot_id = ? AND kept = 1 AND enabled = 1 AND description <> ''
+              ORDER BY created_at DESC, hash ASC LIMIT ?",
+        )
+        .bind(bot_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Write the caption she gave a sticker at keep time, with the search blob
+    /// rebuilt from it. The caller decides whether the new caption wins (it
+    /// only calls this when it does); this function just writes.
+    pub async fn set_sticker_description(
+        &self,
+        bot_id: &str,
+        hash: &str,
+        description: &str,
+        search_blob: &str,
+    ) -> BotResult<bool> {
+        let res = sqlx::query(
+            "UPDATE stickers SET description = ?, search_blob = ?
+              WHERE hash = ? AND bot_id = ?",
+        )
+        .bind(description)
+        .bind(search_blob)
+        .bind(hash)
+        .bind(bot_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
     pub async fn sticker_semantic_candidates(
         &self,
         bot_id: &str,

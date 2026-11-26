@@ -7,7 +7,7 @@ pub mod download;
 pub mod resize;
 pub mod workspace;
 
-pub use collage::{MAX_BATCH_IMAGES, MAX_EDGE, Transport, fit_for_agy, fit_for_vision};
+pub use collage::{MAX_BATCH_IMAGES, MAX_EDGE, Transport, fit_for_agy};
 pub use download::{DownloadedImage, HttpFetcher, ImageFetcher, MediaError, check_url};
 pub use resize::{PreparedImage, prepare};
 pub use workspace::SandboxWorkspace;

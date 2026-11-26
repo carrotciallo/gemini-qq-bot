@@ -239,17 +239,18 @@ impl TurnExecutor {
             return Err(TurnResult::BadOutput);
         }
 
-        // 3.4 Tag every image and persist the stickers *before* the reply gate runs.
-        // A batch the gate decides not to answer must still contribute pictures to the
-        // library: her not wanting to talk does not mean the sticker was unwanted.
+        // 3.4 Make every image visible and persist the stickers *before* the reply
+        // gate runs. A batch the gate decides not to answer must still contribute
+        // pictures to the library: her not wanting to talk does not mean the
+        // sticker was unwanted.
         let (image_context, tagged_images) = prepare_image_context(
             self.media_fetcher.as_ref(),
             &messages,
             self.media_max_bytes,
             self.media_max_pixels,
-            self.image_describer.as_deref(),
+            &self.store,
             &self.bot_id,
-            &job.group_id,
+            &self.project_dir(&job.group_id),
         )
         .await;
         // Image losses get one audit line per turn that has any: the stages
@@ -278,9 +279,12 @@ impl TurnExecutor {
                 )
                 .await;
         }
-        // Write each picture's description next to its own row. Without this the column
-        // stays NULL forever, so `memory_search` sees only the `[图片]` placeholder that
-        // normalize.rs left in `text` and can say nothing about what the picture was.
+        // Write each recognised picture's description next to its own row. Without
+        // this the column stays NULL forever, so `memory_search` sees only the
+        // `[图片]` placeholder that normalize.rs left in `text` and can say nothing
+        // about what the picture was. Pictures she merely looked at this turn carry
+        // no description — nothing was written down about them, and inventing one
+        // here would put words in the record nobody said.
         let mut tags_by_message: std::collections::HashMap<usize, Vec<serde_json::Value>> =
             std::collections::HashMap::new();
         for image in &tagged_images {
@@ -318,9 +322,10 @@ impl TurnExecutor {
                 )
                 .await;
         }
-        // A1′ offer signals: what the vision tagger said about this batch's
-        // own pictures, in the same vocabulary the library rows are tagged
-        // with. Collected before the persist step consumes the vector.
+        // A1′ offer signals: what the library already knows about this batch's
+        // own pictures (recognised rows only — a picture she merely looked at
+        // contributes nothing). Collected before the persist step consumes
+        // the vector; empty signals fall back to the batch's own text.
         let offer_signals: Vec<String> = tagged_images
             .iter()
             .map(|image| {

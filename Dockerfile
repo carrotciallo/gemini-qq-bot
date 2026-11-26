@@ -136,7 +136,6 @@ ENV RUST_LOG=info \
     MIHOMO_BIN=/opt/mihomo/mihomo \
     MIHOMO_CONFIG_PATH=/etc/mihomo/config.yaml \
     GEMINI_DB_PATH=/data/bot.sqlite3 \
-    AUX_API_KEY_FILE=/run/secrets/aux_api_key \
     ADMIN_BIND=0.0.0.0:8080
 
 USER 10001:10001

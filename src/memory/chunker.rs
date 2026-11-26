@@ -234,7 +234,7 @@ impl Chunker {
     pub fn new(store: Arc<SqliteStore>) -> Self {
         Self {
             store,
-            model_label: crate::config::DEFAULT_AUX_MODEL.to_string(),
+            model_label: crate::config::DEFAULT_AGY_MODEL.to_string(),
         }
     }
 

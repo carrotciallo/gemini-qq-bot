@@ -4,11 +4,11 @@
 //! blocking a production run?* So every subsystem reports both its state **and**
 //! whether that state was actually verified, instead of a single green dot.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::agent::agy::{AGY_CLI_VERSION, AgyPermissions, PermissionAudit};
-use crate::integrations::aux_gateway::AuxGatewayStatus;
+
 use crate::process::ProxyHealth;
 
 /// OneBot connection health.
@@ -79,6 +79,42 @@ pub struct OwnerStatus {
     pub configured: bool,
 }
 
+/// Health row for the aux (memory) session.
+///
+/// This used to describe an external gateway (`AuxStatus`); since
+/// the 2026-11-24 teardown the only aux there is is the dedicated Agy
+/// memory session, so the row is built from its liveness alone. The
+/// gateway-era probe fields stay in the serialized shape at their
+/// not-applicable values so status consumers do not change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuxStatus {
+    /// Which aux backend this status describes: always `"agy"` now.
+    /// Empty in statuses serialized before the field existed (= gateway).
+    #[serde(default)]
+    pub mode: String,
+    pub enabled: bool,
+    pub health_ok: bool,
+    pub models_ok: bool,
+    pub model_published: bool,
+    pub key_present: bool,
+    pub last_error: Option<String>,
+    pub ready: bool,
+}
+
+impl AuxStatus {
+    /// Status for the memory session: `healthy` is its current liveness.
+    pub fn agy_mode(healthy: bool) -> Self {
+        Self {
+            mode: "agy".to_string(),
+            enabled: true,
+            health_ok: healthy,
+            last_error: (!healthy).then(|| "aux session unavailable".to_string()),
+            ready: healthy,
+            ..Self::default()
+        }
+    }
+}
+
 /// Everything the panel renders.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HealthSnapshot {
@@ -88,7 +124,7 @@ pub struct HealthSnapshot {
     pub proxy: Option<ProxyHealth>,
     pub proxy_enabled: bool,
     pub agy: Option<AgyHealth>,
-    pub aux: Option<AuxGatewayStatus>,
+    pub aux: Option<AuxStatus>,
     pub owner: OwnerStatus,
     /// True only when every gate is open *and* verified.
     pub production_ready: bool,
@@ -106,7 +142,7 @@ impl HealthSnapshot {
         if self.proxy_enabled {
             match &self.proxy {
                 Some(p) if p.ready(true) => {}
-                _ => blockers.push("Mihomo 代理或美国节点检查未通过".to_string()),
+                _ => blockers.push("Mihomo 代理或固定 VPS 节点检查未通过".to_string()),
             }
         }
         match &self.agy {
@@ -128,26 +164,11 @@ impl HealthSnapshot {
         }
         match &self.aux {
             None => blockers.push("Aux compactor 未配置".to_string()),
-            Some(w) if w.mode == "agy" => {
+            Some(w) => {
                 if !w.ready {
                     blockers.push("Aux（agy 模式）辅助会话不可用".to_string());
                 }
             }
-            Some(w) if !w.ready => {
-                if !w.enabled {
-                    blockers.push("Aux 记忆压缩未启用".to_string());
-                } else if !w.model_published {
-                    blockers.push(format!(
-                        "Aux 未发布 {} 模型",
-                        crate::config::DEFAULT_AUX_MODEL
-                    ));
-                } else if !w.key_present {
-                    blockers.push("Aux 专用 API key 未配置".to_string());
-                } else {
-                    blockers.push("Aux 网关健康检查未通过".to_string());
-                }
-            }
-            Some(_) => {}
         }
         if !self.owner.configured {
             blockers.push("OWNER_QQ_ID 未配置".to_string());
@@ -191,7 +212,7 @@ impl HealthRegistry {
         self.update(|s| s.proxy = Some(health)).await
     }
 
-    pub async fn set_aux(&self, status: AuxGatewayStatus) -> HealthSnapshot {
+    pub async fn set_aux(&self, status: AuxStatus) -> HealthSnapshot {
         self.update(|s| s.aux = Some(status)).await
     }
 
@@ -233,24 +254,15 @@ mod tests {
         ProxyHealth {
             process_running: true,
             api_ok: true,
-            us_node_ok: true,
+            vps_node_ok: true,
             selected_node: Some("US-01".into()),
             last_error: None,
             restarts: 0,
         }
     }
 
-    fn ready_aux() -> AuxGatewayStatus {
-        AuxGatewayStatus {
-            mode: "gateway".to_string(),
-            enabled: true,
-            health_ok: true,
-            models_ok: true,
-            model_published: true,
-            key_present: true,
-            last_error: None,
-            ready: true,
-        }
+    fn ready_aux() -> AuxStatus {
+        AuxStatus::agy_mode(true)
     }
 
     fn snapshot() -> HealthSnapshot {
@@ -299,14 +311,14 @@ mod tests {
                 needles: &["schema", "模型 ID", "会话"],
             },
             Case {
-                name: "missing us node",
+                name: "missing vps node",
                 mutate: |s| {
                     if let Some(p) = s.proxy.as_mut() {
-                        p.us_node_ok = false;
+                        p.vps_node_ok = false;
                     }
                 },
                 ready: false,
-                needles: &["美国节点"],
+                needles: &["固定 VPS 节点"],
             },
             Case {
                 name: "disabled proxy",
@@ -318,15 +330,15 @@ mod tests {
                 needles: &[],
             },
             Case {
-                name: "unpublished aux model",
+                name: "aux session unavailable",
                 mutate: |s| {
                     if let Some(w) = s.aux.as_mut() {
-                        w.model_published = false;
+                        w.health_ok = false;
                         w.ready = false;
                     }
                 },
                 ready: false,
-                needles: &[crate::config::DEFAULT_AUX_MODEL],
+                needles: &["Aux（agy 模式）辅助会话不可用"],
             },
             Case {
                 name: "owner absence",

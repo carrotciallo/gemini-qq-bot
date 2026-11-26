@@ -5,8 +5,13 @@
 //! `runtime-settings.json` next to the database (the deployed config file
 //! is a read-only mount, so it is never rewritten), applied to the live
 //! consumers immediately, and re-applied on top of the file config at the
-//! next startup. The aux API key is write-only over the API: views report
-//! only whether one is set.
+//! next startup.
+//!
+//! The overlay used to also carry the aux gateway configuration; that
+//! whole surface was removed with the gateway teardown (2026-11-24).
+//! Old overlay files may still contain `aux_*` keys — serde ignores
+//! unknown fields on load, and the next persist rewrites the file
+//! without them.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -15,18 +20,11 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::app::pacing::PacingEngine;
-use crate::integrations::aux_gateway::{AuxGatewayClient, AuxGatewayConfig, AuxGatewayStatus};
-use crate::integrations::aux_slot::{AgyAuxParams, AuxSlot, build_provider};
 
 /// The persisted overlay. Every field is optional: absent means "the file
 /// config decides".
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SettingsOverlay {
-    pub aux_enabled: Option<bool>,
-    pub aux_base_url: Option<String>,
-    pub aux_model: Option<String>,
-    pub aux_session_header: Option<String>,
-    pub aux_api_key: Option<String>,
     pub session_rotation_enabled: Option<bool>,
     pub quota_degradation_enabled: Option<bool>,
 }
@@ -45,50 +43,6 @@ impl SettingsOverlay {
     }
 }
 
-/// The gateway config with the overlay applied.
-pub fn effective_aux_config(
-    base: &AuxGatewayConfig,
-    overlay: &SettingsOverlay,
-) -> AuxGatewayConfig {
-    let mut config = base.clone();
-    if let Some(enabled) = overlay.aux_enabled {
-        config.enabled = enabled;
-    }
-    if let Some(base_url) = &overlay.aux_base_url {
-        config.base_url = base_url.clone();
-    }
-    if let Some(model) = &overlay.aux_model {
-        config.model = model.clone();
-    }
-    if let Some(header) = &overlay.aux_session_header {
-        config.session_header = header.clone();
-    }
-    config.api_key_override = overlay.aux_api_key.clone();
-    config
-}
-
-/// A partial aux update from the settings API. `None` leaves a field
-/// alone; for the API key, `Some("")` clears the overlay key.
-#[derive(Debug, Clone, Default)]
-pub struct AuxPatch {
-    pub enabled: Option<bool>,
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-    pub session_header: Option<String>,
-    pub api_key: Option<String>,
-}
-
-/// What the settings API reports about the aux layer.
-#[derive(Debug, Clone, Serialize)]
-pub struct AuxSettingsView {
-    pub mode: &'static str,
-    pub enabled: bool,
-    pub base_url: String,
-    pub model: String,
-    pub session_header: String,
-    pub api_key_set: bool,
-}
-
 /// What the settings API reports about the two runtime switches.
 #[derive(Debug, Clone, Serialize)]
 pub struct SwitchView {
@@ -100,9 +54,6 @@ pub struct SwitchView {
 pub struct RuntimeSettings {
     path: Option<PathBuf>,
     overlay: RwLock<SettingsOverlay>,
-    base_aux: AuxGatewayConfig,
-    agy: AgyAuxParams,
-    slot: Arc<AuxSlot>,
     pacing: Arc<PacingEngine>,
     rotation: Arc<AtomicI64>,
     /// The cap that applies while rotation is on (already resolved).
@@ -112,13 +63,9 @@ pub struct RuntimeSettings {
 }
 
 impl RuntimeSettings {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: Option<PathBuf>,
         overlay: SettingsOverlay,
-        base_aux: AuxGatewayConfig,
-        agy: AgyAuxParams,
-        slot: Arc<AuxSlot>,
         pacing: Arc<PacingEngine>,
         rotation: Arc<AtomicI64>,
         rotation_cap: Option<i64>,
@@ -128,9 +75,6 @@ impl RuntimeSettings {
         Arc::new(Self {
             path,
             overlay: RwLock::new(overlay),
-            base_aux,
-            agy,
-            slot,
             pacing,
             rotation,
             rotation_cap,
@@ -142,21 +86,9 @@ impl RuntimeSettings {
     /// A settings handle over a scratch directory, for admin route tests.
     #[cfg(test)]
     pub fn for_tests(dir: PathBuf, pacing: Arc<PacingEngine>) -> Arc<Self> {
-        let base_aux = AuxGatewayConfig::new(None, None, dir.join("absent-key"), false);
-        let agy = AgyAuxParams {
-            bin: dir.join("absent-agy"),
-            home: dir.join("absent-home"),
-            workspace: dir.join("aux-ws"),
-            model: "test-model".to_string(),
-            turn_limit: 35,
-        };
-        let provider = build_provider(base_aux.clone(), &agy);
         Self::new(
             Some(dir.join("runtime-settings.json")),
             SettingsOverlay::default(),
-            base_aux,
-            agy,
-            Arc::new(AuxSlot::new(provider)),
             pacing,
             Arc::new(AtomicI64::new(-1)),
             Some(35),
@@ -172,19 +104,6 @@ impl RuntimeSettings {
             .clone()
     }
 
-    pub fn aux_view(&self) -> AuxSettingsView {
-        let config = effective_aux_config(&self.base_aux, &self.overlay());
-        let api_key_set = config.read_api_key().is_some();
-        AuxSettingsView {
-            mode: self.slot.provider().llm.mode_name(),
-            enabled: config.enabled,
-            base_url: config.base_url,
-            model: config.model,
-            session_header: config.session_header,
-            api_key_set,
-        }
-    }
-
     pub fn switch_view(&self) -> SwitchView {
         let overlay = self.overlay();
         SwitchView {
@@ -195,52 +114,6 @@ impl RuntimeSettings {
                 .quota_degradation_enabled
                 .unwrap_or(self.file_degradation_enabled),
         }
-    }
-
-    /// Apply an aux patch: persist first, then swap the live provider, so
-    /// a failed write changes nothing.
-    pub fn update_aux(&self, patch: AuxPatch) -> Result<AuxSettingsView, String> {
-        let mut overlay = self.overlay();
-        if let Some(enabled) = patch.enabled {
-            overlay.aux_enabled = Some(enabled);
-        }
-        if let Some(base_url) = patch.base_url {
-            overlay.aux_base_url = Some(base_url);
-        }
-        if let Some(model) = patch.model {
-            overlay.aux_model = Some(model);
-        }
-        if let Some(header) = patch.session_header {
-            overlay.aux_session_header = Some(header);
-        }
-        if let Some(key) = patch.api_key {
-            overlay.aux_api_key = if key.is_empty() { None } else { Some(key) };
-        }
-        self.persist(&overlay)?;
-        let config = effective_aux_config(&self.base_aux, &overlay);
-        self.slot.swap(build_provider(config, &self.agy));
-        *self.overlay.write().unwrap_or_else(|e| e.into_inner()) = overlay;
-        Ok(self.aux_view())
-    }
-
-    /// Probe a candidate gateway config without swapping it in.
-    pub async fn test_aux(&self, patch: AuxPatch) -> AuxGatewayStatus {
-        let mut overlay = self.overlay();
-        if let Some(base_url) = patch.base_url {
-            overlay.aux_base_url = Some(base_url);
-        }
-        if let Some(model) = patch.model {
-            overlay.aux_model = Some(model);
-        }
-        if let Some(header) = patch.session_header {
-            overlay.aux_session_header = Some(header);
-        }
-        if let Some(key) = patch.api_key {
-            overlay.aux_api_key = if key.is_empty() { None } else { Some(key) };
-        }
-        let mut config = effective_aux_config(&self.base_aux, &overlay);
-        config.enabled = true;
-        AuxGatewayClient::new(config).probe().await
     }
 
     /// Apply the runtime switches: persist first, then flip the live
@@ -295,10 +168,8 @@ mod tests {
     #[test]
     fn overlay_round_trips_through_json() {
         let overlay = SettingsOverlay {
-            aux_enabled: Some(true),
-            aux_model: Some("m".to_string()),
+            session_rotation_enabled: Some(true),
             quota_degradation_enabled: Some(false),
-            ..Default::default()
         };
         let raw = serde_json::to_string(&overlay).expect("serialize");
         let back: SettingsOverlay = serde_json::from_str(&raw).expect("parse");
@@ -313,23 +184,11 @@ mod tests {
     }
 
     #[test]
-    fn effective_config_prefers_overlay_and_key_override() {
-        let base = AuxGatewayConfig::new(
-            Some("http://base:1".to_string()),
-            Some("base-model".to_string()),
-            PathBuf::from("/absent/key"),
-            false,
-        );
-        let overlay = SettingsOverlay {
-            aux_enabled: Some(true),
-            aux_base_url: Some("http://override:2".to_string()),
-            aux_api_key: Some("secret".to_string()),
-            ..Default::default()
-        };
-        let config = effective_aux_config(&base, &overlay);
-        assert!(config.enabled);
-        assert_eq!(config.base_url, "http://override:2");
-        assert_eq!(config.model, "base-model");
-        assert_eq!(config.read_api_key().as_deref(), Some("secret"));
+    fn legacy_aux_keys_in_an_old_overlay_are_ignored() {
+        let raw = r#"{"aux_enabled": true, "aux_model": "hy3", "aux_api_key": "x",
+                      "quota_degradation_enabled": false}"#;
+        let overlay: SettingsOverlay = serde_json::from_str(raw).expect("parse");
+        assert_eq!(overlay.quota_degradation_enabled, Some(false));
+        assert_eq!(overlay.session_rotation_enabled, None);
     }
 }

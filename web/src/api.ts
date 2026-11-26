@@ -114,12 +114,23 @@ export interface AuxStatus {
   [key: string]: unknown;
 }
 
+export interface ProxyHealth {
+  process_running: boolean;
+  api_ok: boolean;
+  vps_node_ok: boolean;
+  selected_node: string | null;
+  last_error: string | null;
+  restarts: number;
+}
+
 export interface Status {
   bot_id: string;
   health: {
     production_ready: boolean;
     blockers: string[];
     aux: AuxStatus | null;
+    proxy: ProxyHealth | null;
+    proxy_enabled: boolean;
     [key: string]: unknown;
   };
   groups: number;

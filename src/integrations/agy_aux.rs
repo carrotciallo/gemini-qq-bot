@@ -28,15 +28,17 @@ use base64::Engine as _;
 use crate::agent::resident::{DbStepReader, ResidentConfig, ResidentSession};
 use crate::agent::step_stream::parse_steps;
 use crate::error::ErrorClass;
-use crate::integrations::aux_gateway::SUMMARY_SYSTEM;
-use crate::integrations::aux_llm::AuxLlm;
+/// Pinned system prompt for memory compaction. Byte-identical on every
+/// call so the upstream cache stays warm. (Moved here from the gateway
+/// adapter when the gateway was removed: the memory session is the only
+/// consumer the prompt ever had in production.)
+pub const SUMMARY_SYSTEM: &str =
+    "You compress group memory notes into a short summary. Output JSON only.";
 use crate::memory::compaction::SummaryModel;
 
 /// Per-call deadlines. Agy turns are far slower than gateway calls, and
 /// every caller already fails open, so a deadline expiry costs one aux
 /// job, never a group turn.
-const TEXT_TIMEOUT: Duration = Duration::from_secs(90);
-const VISION_TIMEOUT: Duration = Duration::from_secs(120);
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(150);
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// Polls with an unchanged step stream before a model text counts as
@@ -259,77 +261,12 @@ impl AgyAuxClient {
         self.degraded.store(result.is_err(), Ordering::Relaxed);
         result
     }
-
-    /// Decode one data URL into a workspace file and return its path.
-    async fn stage_image(&self, data_url: &str) -> Result<PathBuf, ErrorClass> {
-        let (meta, payload) = data_url
-            .strip_prefix("data:")
-            .and_then(|rest| rest.split_once(";base64,"))
-            .ok_or(ErrorClass::AuxBadOutput)?;
-        let ext = match meta {
-            "image/jpeg" => "jpg",
-            "image/png" => "png",
-            "image/webp" => "webp",
-            "image/gif" => "gif",
-            _ => "bin",
-        };
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(payload.trim())
-            .map_err(|_| ErrorClass::AuxBadOutput)?;
-        tokio::fs::create_dir_all(&self.workspace)
-            .await
-            .map_err(|_| ErrorClass::Unavailable)?;
-        let seq = self.image_seq.fetch_add(1, Ordering::Relaxed);
-        let path = self.workspace.join(format!("aux-img-{seq}.{ext}"));
-        tokio::fs::write(&path, bytes)
-            .await
-            .map_err(|_| ErrorClass::Unavailable)?;
-        Ok(path)
-    }
 }
 
-#[async_trait]
-impl AuxLlm for AgyAuxClient {
-    async fn complete_streaming(
-        &self,
-        system: &str,
-        prompt: &str,
-        _session: Option<&str>,
-    ) -> Result<String, ErrorClass> {
-        self.ask(&format!("{system}\n\n{prompt}"), TEXT_TIMEOUT)
-            .await
-    }
-
-    async fn complete_vision_on(
-        &self,
-        _model: &str,
-        system: &str,
-        prompt: &str,
-        images: &[String],
-        _session: Option<&str>,
-    ) -> Result<String, ErrorClass> {
-        // A staged image the session cannot open would silently shift the
-        // caller's positional mapping, so a bad data URL fails the call —
-        // the caller's per-image fallback marks that picture untagged.
-        let mut refs = String::new();
-        for url in images {
-            let path = self.stage_image(url).await?;
-            refs.push_str(&format!("\n@{}", path.display()));
-        }
-        let full = format!("{system}\n\n{prompt}\n\n本轮图片（逐个查看）：{refs}");
-        self.ask(&full, VISION_TIMEOUT).await
-    }
-
-    async fn complete_summary(&self, prompt: &str) -> Result<String, ErrorClass> {
-        self.ask(&format!("{SUMMARY_SYSTEM}\n\n{prompt}"), SUMMARY_TIMEOUT)
-            .await
-    }
-
-    fn mode_name(&self) -> &'static str {
-        "agy"
-    }
-
-    async fn healthy(&self) -> bool {
+impl AgyAuxClient {
+    /// Cheap liveness for the health snapshot and the spontaneous
+    /// engine's gate: the session has not degraded.
+    pub async fn healthy(&self) -> bool {
         !self.degraded.load(Ordering::Relaxed)
     }
 }
@@ -337,7 +274,8 @@ impl AuxLlm for AgyAuxClient {
 #[async_trait]
 impl SummaryModel for AgyAuxClient {
     async fn summarise(&self, prompt: String) -> Result<String, ErrorClass> {
-        self.complete_summary(&prompt).await
+        self.ask(&format!("{SUMMARY_SYSTEM}\n\n{prompt}"), SUMMARY_TIMEOUT)
+            .await
     }
 }
 
@@ -374,51 +312,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_prepends_the_system_text() {
-        let (client, _dir, prompts) = client("verdict");
-        let out = client
-            .complete_streaming("SYS", "judge this", None)
-            .await
-            .expect("ok");
-        assert_eq!(out, "verdict");
-        assert_eq!(
-            prompts.lock().unwrap().as_slice(),
-            ["SYS\n\njudge this".to_string()]
-        );
-    }
-
-    #[tokio::test]
     async fn summary_uses_the_pinned_summary_system() {
         let (client, _dir, prompts) = client("{}");
-        client.complete_summary("fold this").await.expect("ok");
+        client.summarise("fold this".to_string()).await.expect("ok");
         let prompts = prompts.lock().unwrap();
         assert!(prompts[0].starts_with(SUMMARY_SYSTEM));
         assert!(prompts[0].ends_with("fold this"));
-    }
-
-    #[tokio::test]
-    async fn vision_stages_images_as_files() {
-        let (client, dir, prompts) = client("[]");
-        // 1x1 transparent PNG.
-        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-        client
-            .complete_vision_on("any", "SYS", "tag", &[png.to_string()], None)
-            .await
-            .expect("ok");
-        let staged = dir.path().join("aux-img-0.png");
-        assert!(staged.exists(), "image staged into the workspace");
-        let prompts = prompts.lock().unwrap();
-        assert!(prompts[0].contains(&format!("@{}", staged.display())));
-    }
-
-    #[tokio::test]
-    async fn vision_rejects_a_bad_data_url() {
-        let (client, _dir, _prompts) = client("[]");
-        let err = client
-            .complete_vision_on("any", "SYS", "tag", &["not-a-data-url".to_string()], None)
-            .await
-            .expect_err("must fail");
-        assert_eq!(err, ErrorClass::AuxBadOutput);
     }
 }
 

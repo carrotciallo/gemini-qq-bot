@@ -104,7 +104,7 @@ pub(crate) fn pick_diverse<'a>(
 ///
 /// Replaces the A5 arrangement (a flat ×0.25 damping, plus the A4 habit
 /// slot that re-offered the group's most-sent sticker every round): in
-/// group, one broadly-matching self-sticker still took 30% of
+/// one production group one broadly-matching self-sticker still took 30% of
 /// two weeks' sends, because a fixed discount is eaten by a strong raw
 /// score and the habit slot kept putting the same face back on the menu.
 ///

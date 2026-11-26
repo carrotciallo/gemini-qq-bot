@@ -102,14 +102,11 @@ impl Intake {
     }
 
     /// Stage the drained overflow as the group's next-job background
-    /// (flood stage 4). The overflow text goes to hy3 for a short summary
-    /// under a hard [`FLOOD_SUMMARY_TIMEOUT`] cap; any failure — timeout,
-    /// gateway error, empty answer — falls open to the script-truncated
-    /// rendering, so a broken bypass can never break the drain itself.
-    /// Fully async: the flush tick never waits on the model. A claim that
-    /// arrives before the summary lands simply leaves the background for
-    /// the claim after it. hy3 only ever compresses text here; what gets
-    /// dropped or answered stays a script decision.
+    /// (flood stage 4): the script-truncated rendering, staged
+    /// synchronously. Until 2026-11-24 a gateway summary could replace
+    /// the truncation when it landed in time; with the gateway gone the
+    /// truncation is the only rendering, which was always the fail-open
+    /// floor of that design.
     pub(super) fn stage_flood_background(
         &self,
         group_id: &str,
@@ -120,46 +117,9 @@ impl Intake {
             return;
         }
         let fallback = truncate_background(&overflow_text);
-        let Some(client) = self.aux.clone() else {
-            // No summary channel: the truncated rendering is the
-            // background, staged synchronously.
-            if let Ok(mut map) = self.flood_backgrounds.lock() {
-                map.insert(group_id.to_string(), fallback);
-            }
-            return;
-        };
-        let backgrounds = std::sync::Arc::clone(&self.flood_backgrounds);
-        let store = Arc::clone(&self.store);
-        let bot_id = self.bot_id.clone();
-        let group_id = group_id.to_string();
-        tokio::spawn(async move {
-            let summary = match tokio::time::timeout(
-                FLOOD_SUMMARY_TIMEOUT,
-                client.complete_streaming(
-                    FLOOD_SUMMARY_SYSTEM,
-                    &flood_summary_prompt(&overflow_text),
-                    None,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(text)) => Some(text),
-                _ => None,
-            };
-            let (text, kind) = resolve_flood_background(summary, fallback);
-            if let Ok(mut map) = backgrounds.lock() {
-                map.insert(group_id.clone(), text);
-            }
-            let _ = store
-                .audit(
-                    "system",
-                    &format!("intake.flood.summary.g{group_id}.{kind}"),
-                    Some(&bot_id),
-                    Some(&group_id),
-                    crate::now_unix(),
-                )
-                .await;
-        });
+        if let Ok(mut map) = self.flood_backgrounds.lock() {
+            map.insert(group_id.to_string(), fallback);
+        }
     }
 
     /// Delete stale rows and leave one audit row saying how many and how old.
@@ -192,8 +152,6 @@ impl Intake {
     }
 }
 
-pub const FLOOD_SUMMARY_SYSTEM: &str = "You compress a backlog of QQ group chat messages into a short plain-text background brief. Output plain text only, no JSON, no preamble.";
-
 /// Per-line cap when rendering overflow rows for the summary input.
 pub const FLOOD_LINE_CHARS: usize = 200;
 
@@ -204,15 +162,6 @@ pub const FLOOD_OVERFLOW_MAX_CHARS: usize = 8000;
 /// summary is asked for ~300 chars and hard-capped here, and the
 /// script-truncated fallback is cut to the same budget.
 pub const FLOOD_BACKGROUND_MAX_CHARS: usize = 1000;
-
-/// The summary call's user prompt: the overflow, oldest first, with the
-/// compression contract stated plainly — facts only from the text, no
-/// per-message replay.
-pub(super) fn flood_summary_prompt(overflow_text: &str) -> String {
-    format!(
-        "下面是群聊里积压的一批较早消息，按时间顺序排列。把它们压成一段简短的背景摘要：只保留话题、未决的问题和已达成的结论，不要引入原文没有的事实，不要逐条复述，控制在 300 字以内。\n\n{overflow_text}"
-    )
-}
 
 /// Render drained overflow rows as plain `name：text` lines for the
 /// summary input (and, truncated, for the fail-open background). Rows
@@ -256,26 +205,6 @@ pub(super) fn truncate_background(overflow_text: &str) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
-}
-
-/// The stage-4 fail-open decision, pure so tests can pin it: a non-empty
-/// summary wins (capped — hy3 can ramble), anything else keeps the
-/// truncated rendering. The second element is the audit suffix.
-pub(super) fn resolve_flood_background(
-    summary: Option<String>,
-    fallback: String,
-) -> (String, &'static str) {
-    match summary {
-        Some(text) if !text.trim().is_empty() => {
-            let capped: String = text
-                .trim()
-                .chars()
-                .take(FLOOD_BACKGROUND_MAX_CHARS)
-                .collect();
-            (capped, "ok")
-        }
-        _ => (fallback, "fallback"),
-    }
 }
 
 /// A pending pool larger than this is a flood, not a backlog: the group is

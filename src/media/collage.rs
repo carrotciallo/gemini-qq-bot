@@ -55,13 +55,6 @@ impl Transport {
 /// Largest image file Agy is allowed to read.
 pub const AGY_IMAGE_MAX_BYTES: usize = 1_048_576;
 
-/// Largest base64 payload the gate may spend per call.
-///
-/// Four images of ~500 KiB each already exceed the useful resolution of the tag model,
-/// so the budget is per call rather than per image: it caps the whole request and lets a
-/// single big picture use most of it.
-pub const VISION_MAX_BASE64_BYTES: usize = 1_400_000;
-
 /// Largest base64 payload one outgoing sticker may take.
 ///
 /// One mebibyte of encoded picture is the frame budget the send path was written
@@ -121,20 +114,6 @@ fn fit_for_agy_within(bytes: &[u8], ceiling: usize) -> Option<Vec<u8>> {
         image = image::imageops::thumbnail(&image, next_w, next_h);
     }
     None
-}
-
-/// Encode one image as a JPEG data URL small enough for the gate's multimodal call.
-///
-/// Base64 inflates by 4/3, so the encoder is given the deflated ceiling. If even the
-/// smallest encoding is too large the image is reported as unavailable instead of being
-/// silently truncated — a half-decoded image would tag the wrong picture.
-pub fn fit_for_vision(bytes: &[u8]) -> Option<String> {
-    let jpeg = fit_for_agy_within(bytes, VISION_MAX_BASE64_BYTES / 4 * 3)?;
-    let base64 = base64_encode(&jpeg);
-    if base64.len() > VISION_MAX_BASE64_BYTES {
-        return None;
-    }
-    Some(format!("data:image/jpeg;base64,{base64}"))
 }
 
 /// Minimal standard base64 (RFC 4648, padded). Avoids a new dependency for every call site.
@@ -245,16 +224,6 @@ mod tests {
     }
 
     #[test]
-    fn vision_data_url_is_bounded_and_well_formed() {
-        let big = prepared(4_000, 3_000);
-        let url = fit_for_vision(&big.bytes).expect("应能压缩");
-        assert!(url.starts_with("data:image/jpeg;base64,"));
-        let payload = url.trim_start_matches("data:image/jpeg;base64,");
-        assert!(payload.len() <= VISION_MAX_BASE64_BYTES);
-        assert!(!payload.contains(' '));
-    }
-
-    #[test]
     fn base64_matches_rfc4648_vectors() {
         assert_eq!(base64_encode(b""), "");
         assert_eq!(base64_encode(b"f"), "Zg==");
@@ -266,7 +235,6 @@ mod tests {
     #[test]
     fn non_image_bytes_are_reported_rather_than_guessed() {
         assert!(fit_for_agy(b"not an image").is_none());
-        assert!(fit_for_vision(b"not an image").is_none());
         assert!(fit_for_agy(b"").is_none());
     }
 }

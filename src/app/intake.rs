@@ -90,14 +90,6 @@ pub struct Intake {
     bot_id: String,
     owner_qq_id: String,
     limits: IntakeLimits,
-    /// Last gate judgement per group: `(widest_id, score, judged_at)`.
-    ///
-    /// Cached so a burst that produced no new message is not re-scored every tick: the
-    /// score is a statement about the text, and the text has not changed. Time alone is
-    /// then handled by arithmetic in [`Self::burst_may_hand_over`], never by the model.
-    pace: std::sync::Mutex<
-        std::collections::HashMap<String, (i64, crate::app::preflight::BurstScore, i64)>,
-    >,
     /// Last cadence action written to the audit log, per group.
     ///
     /// The tick runs twice a second, so writing every judgement would bury the table in
@@ -122,9 +114,6 @@ pub struct Intake {
     /// it — the verdict is a statement about the text, and the text has
     /// not changed. In memory on purpose: losing it on restart costs one
     /// duplicate judge call.
-    relevance_cache: std::sync::Mutex<
-        std::collections::HashMap<String, (i64, crate::app::relevance::Relevance)>,
-    >,
     /// Last time each group claimed an ambient-only batch (the quiet
     /// tier's cooldown clock). In memory on purpose, like the other marks.
     ambient_claims: std::sync::Mutex<std::collections::HashMap<String, i64>>,
@@ -143,10 +132,6 @@ pub struct Intake {
     /// draining tick has already returned. In memory on purpose: losing it
     /// on restart costs one missing background block, nothing more.
     flood_backgrounds: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
-    /// The Aux (hy3) client for the stage-4 summary bypass. `None`
-    /// in tests and when the gateway is unconfigured, in which case a drain
-    /// stages the script-truncated rendering directly.
-    aux: Option<std::sync::Arc<dyn crate::integrations::aux_llm::AuxLlm>>,
     /// Per-turn memory digest, computed *inside* the pacing gate's wait.
     ///
     /// `None` when the Aux gateway is not configured: without a model there is no
@@ -216,19 +201,16 @@ impl Intake {
             bot_id,
             owner_qq_id,
             limits,
-            pace: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_cadence: std::sync::Mutex::new(std::collections::HashMap::new()),
             budget_marks: std::sync::Mutex::new(std::collections::HashMap::new()),
             damper_wait_marks: std::sync::Mutex::new(std::collections::HashMap::new()),
             flood_marks: std::sync::Mutex::new(std::collections::HashSet::new()),
             call_names: Vec::new(),
-            relevance_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             ambient_claims: std::sync::Mutex::new(std::collections::HashMap::new()),
             relevance_marks: std::sync::Mutex::new(std::collections::HashMap::new()),
             flood_backgrounds: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            aux: None,
             digest: None,
             pacing: None,
             resident: None,
@@ -261,15 +243,6 @@ impl Intake {
         self
     }
 
-    /// Attach the Aux (hy3) client for the flood-summary bypass
-    /// (stage 4). Built outside so tests can leave it off: without it a
-    /// drain still stages a background — the script-truncated rendering —
-    /// it just never becomes a summary.
-    pub fn with_aux(mut self, client: Arc<dyn crate::integrations::aux_llm::AuxLlm>) -> Self {
-        self.aux = Some(client);
-        self
-    }
-
     /// The pacing engine, when one is configured.
     pub fn pacing(&self) -> Option<&Arc<crate::app::pacing::PacingEngine>> {
         self.pacing.as_ref()
@@ -290,11 +263,9 @@ impl Intake {
         fn len<K, V, S>(map: &std::sync::Mutex<std::collections::HashMap<K, V, S>>) -> usize {
             map.lock().map(|map| map.len()).unwrap_or(0)
         }
-        len(&self.pace)
-            + len(&self.last_cadence)
+        len(&self.last_cadence)
             + len(&self.budget_marks)
             + len(&self.damper_wait_marks)
-            + len(&self.relevance_cache)
             + len(&self.ambient_claims)
             + len(&self.relevance_marks)
             + self.flood_marks.lock().map(|set| set.len()).unwrap_or(0)
@@ -343,9 +314,6 @@ impl Intake {
     /// ladder has to survive a rotation, or the backoff that exists to stop a
     /// respawn storm would reset on every rotation.
     pub(crate) async fn forget_group(&self, group_id: &str) {
-        if let Ok(mut pace) = self.pace.lock() {
-            pace.remove(group_id);
-        }
         if let Ok(mut seen) = self.last_cadence.lock() {
             seen.remove(group_id);
         }
@@ -354,9 +322,6 @@ impl Intake {
         }
         if let Ok(mut marks) = self.damper_wait_marks.lock() {
             marks.retain(|(group, _), _| group != group_id);
-        }
-        if let Ok(mut cache) = self.relevance_cache.lock() {
-            cache.remove(group_id);
         }
         if let Ok(mut claims) = self.ambient_claims.lock() {
             claims.remove(group_id);
@@ -932,28 +897,13 @@ impl Intake {
                 .await;
             return false;
         }
-        let relevance = match self
-            .relevance_cache
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(group_id).copied())
-        {
-            Some((w, verdict)) if w == widest => verdict,
-            _ => {
-                let verdict = self.judge_relevance(group_id, rows).await;
-                if let Ok(mut cache) = self.relevance_cache.lock() {
-                    cache.insert(group_id.clone(), (widest, verdict));
-                }
-                self.audit_relevance(
-                    group_id,
-                    widest,
-                    &format!("judged.{}", verdict.as_str()),
-                    now,
-                )
-                .await;
-                verdict
-            }
-        };
+        // No relevance judge any more (2026-11-24, owner's decision: the
+        // gateway judge is gone and she judges relevance herself inside
+        // the turn). The gate keeps only its structural rules: the pace
+        // tier above and the ambient quiet cooldown below. `Unavailable`
+        // is exactly the verdict the dead judge already produced for
+        // ~92% of windows, so this preserves production behaviour.
+        let relevance = crate::app::relevance::Relevance::Unavailable;
         let cooldown_ready = match self.ambient_claims.lock() {
             Ok(claims) => claims
                 .get(group_id)
@@ -966,74 +916,12 @@ impl Intake {
                 claims.insert(group_id.clone(), now);
             }
         } else {
-            let reason = if relevance == crate::app::relevance::Relevance::Unrelated {
-                "deferred.unrelated"
-            } else {
-                "deferred.quiet_cooldown"
-            };
+            let reason = "deferred.quiet_cooldown";
             self.audit_relevance(group_id, widest, reason, now).await;
         }
         claim
     }
 
-    /// Ask the relevance judge about one ambient window. Without a
-    /// Aux client (tests, gateway unconfigured) the answer is
-    /// Unavailable, which the gate treats as claimable.
-    async fn judge_relevance(
-        &self,
-        group_id: &str,
-        rows: &[crate::store::PendingEventRow],
-    ) -> crate::app::relevance::Relevance {
-        let Some(client) = self.aux.as_ref() else {
-            return crate::app::relevance::Relevance::Unavailable;
-        };
-        let messages: Vec<crate::onebot::normalize::IncomingMessage> = rows
-            .iter()
-            .filter_map(|r| serde_json::from_str(&r.normalized_payload).ok())
-            .collect();
-        if messages.is_empty() {
-            return crate::app::relevance::Relevance::Unavailable;
-        }
-        let pending_ids: std::collections::HashSet<String> =
-            messages.iter().map(|m| m.message_id.clone()).collect();
-        let members = self
-            .store
-            .list_members(&self.bot_id, group_id)
-            .await
-            .unwrap_or_default();
-        let recent_rows = self
-            .store
-            .recent_unarchived_messages(
-                &self.bot_id,
-                group_id,
-                crate::app::preflight::PREFLIGHT_CONTEXT_MESSAGES,
-            )
-            .await
-            .unwrap_or_default();
-        let recent: Vec<(String, String)> = recent_rows
-            .into_iter()
-            .filter(|m| !pending_ids.contains(&m.message_id))
-            .map(|m| {
-                let who = if m.speaker_role == "bot" {
-                    "me".to_string()
-                } else {
-                    members
-                        .iter()
-                        .find(|mem| mem.user_id == m.sender_id)
-                        .map(|mem| mem.speaker_ref.clone())
-                        .unwrap_or_else(|| "群".to_string())
-                };
-                (who, m.text)
-            })
-            .collect();
-        crate::app::relevance::RelevanceJudge::new(std::sync::Arc::clone(client))
-            .judge(&self.bot_id, group_id, &messages, &recent)
-            .await
-    }
-
-    /// Write a relevance audit row at most once per (group, widest,
-    /// line): a held window is re-evaluated every tick and must not
-    /// flood the table (the same reasoning as the damper wait marks).
     async fn audit_relevance(&self, group_id: &str, widest: i64, line: &str, now: i64) {
         let key = format!("{widest}.{line}");
         if let Ok(mut marks) = self.relevance_marks.lock() {
@@ -1054,11 +942,7 @@ impl Intake {
             .await;
     }
 
-    pub async fn flush_tick(
-        &self,
-        now: i64,
-        gate: Option<&crate::app::preflight::Preflight>,
-    ) -> Vec<BatchJob> {
+    pub async fn flush_tick(&self, now: i64) -> Vec<BatchJob> {
         let groups = match self.store.list_groups(&self.bot_id).await {
             Ok(g) => g,
             Err(_) => return Vec::new(),
@@ -1240,66 +1124,37 @@ impl Intake {
             let (ready, ceiling) = if strict_mode {
                 self.strict_release(&entries, first_at, last_activity, now)
             } else {
-                match gate {
-                    // Without a gate there is nothing to pace on, so the fixed windows still
-                    // apply: quiet, hard age, privileged, or a full batch.
-                    None => {
-                        let trigger = should_flush(
-                            &entries,
-                            first_at,
-                            last_activity,
-                            now,
-                            self.limits.quiet_seconds,
-                            self.limits.max_age_seconds,
-                            self.limits.batch,
-                        );
-                        // Full and aged-out are this path's ceilings: the same promise that
-                        // nothing can be starved forever, expressed without a model.
-                        (
-                            trigger.is_flush(),
-                            matches!(trigger, FlushTrigger::Full | FlushTrigger::MaxAge),
-                        )
-                    }
-                    Some(gate) => {
-                        // A burst younger than the floor is never released, whatever the score
-                        // says: two messages typed back to back must land in one batch, and a
-                        // score of 0 on the first one cannot know that the second is coming.
-                        // See `MIN_BURST_SECONDS` for the replay numbers behind the value.
-                        if now - first_at < crate::app::preflight::MIN_BURST_SECONDS {
-                            self.record_cadence(&group.group_id, "warmup", now).await;
-                            (false, false)
-                        } else {
-                            // Hard ceilings run first and never consult the model. They exist
-                            // only so a gate that is down, slow or confused cannot starve the
-                            // agent forever; on a healthy day the model answers long before.
-                            //
-                            // Every batch dimension is checked, not just the message count:
-                            // four pictures and a few words are already over budget long
-                            // before the fifty-message limit, and missing that would let the
-                            // gate hand over a batch that `split_batches` then has to cut.
-                            let total_chars: usize = entries.iter().map(|e| e.chars).sum();
-                            let total_images: usize = entries.iter().map(|e| e.images).sum();
-                            let at_ceiling = now - first_at >= self.limits.max_age_seconds
-                                || entries.len() >= self.limits.batch.max_messages
-                                || total_chars >= self.limits.batch.max_chars
-                                || total_images >= self.limits.batch.max_images;
-                            if at_ceiling {
-                                self.record_cadence(&group.group_id, "ceiling", now).await;
-                                (true, true)
-                            } else {
-                                let (ready, reason) = self
-                                    .burst_may_hand_over(gate, &group.group_id, &rows, widest, now)
-                                    .await;
-                                let verb = if ready { "hand_over" } else { "wait" };
-                                self.record_cadence(
-                                    &group.group_id,
-                                    &format!("{verb}.{reason}"),
-                                    now,
-                                )
-                                .await;
-                                (ready, false)
-                            }
-                        }
+                // A burst younger than the floor is never released: two messages
+                // typed back to back must land in one batch, and releasing the
+                // first one immediately would split them across two turns.
+                // See `MIN_BURST_SECONDS` for the replay numbers behind the value.
+                if now - first_at < crate::app::preflight::MIN_BURST_SECONDS {
+                    self.record_cadence(&group.group_id, "warmup", now).await;
+                    (false, false)
+                } else {
+                    // Hard ceilings run first. They exist so nothing can starve
+                    // the agent forever, however the burst behaves.
+                    //
+                    // Every batch dimension is checked, not just the message count:
+                    // four pictures and a few words are already over budget long
+                    // before the fifty-message limit, and missing that would let the
+                    // gate hand over a batch that `split_batches` then has to cut.
+                    let total_chars: usize = entries.iter().map(|e| e.chars).sum();
+                    let total_images: usize = entries.iter().map(|e| e.images).sum();
+                    let at_ceiling = now - first_at >= self.limits.max_age_seconds
+                        || entries.len() >= self.limits.batch.max_messages
+                        || total_chars >= self.limits.batch.max_chars
+                        || total_images >= self.limits.batch.max_images;
+                    if at_ceiling {
+                        self.record_cadence(&group.group_id, "ceiling", now).await;
+                        (true, true)
+                    } else {
+                        let (ready, reason) =
+                            self.burst_may_hand_over(&group.group_id, &rows).await;
+                        let verb = if ready { "hand_over" } else { "wait" };
+                        self.record_cadence(&group.group_id, &format!("{verb}.{reason}"), now)
+                            .await;
+                        (ready, false)
                     }
                 }
             };
@@ -1339,10 +1194,6 @@ impl Intake {
                 .await
             {
                 continue;
-            }
-            // Once handed over, this group starts a fresh judgement next time.
-            if let Ok(mut pace) = self.pace.lock() {
-                pace.remove(&group.group_id);
             }
 
             // addressed_only: the claimed context is a fixed range —
@@ -1500,10 +1351,6 @@ pub const BUDGET_PRIORITY_RESERVE: i64 = 15;
 /// minutes after the group moved on (the stale-batch failure mode).
 pub const STALE_ROW_SECONDS: i64 = 600;
 
-/// Hard cap on one stage-4 hy3 summary call: past this the background
-/// falls open to the script-truncated rendering.
-pub const FLOOD_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Pinned system prompt for the flood-summary bypass. Byte-identical on
 /// every call so the gateway prefix cache stays warm (the same discipline
 /// as the memory-compaction prompt). The model only ever compresses here.
@@ -1614,10 +1461,10 @@ mod commands;
 mod flood;
 mod gates;
 
+#[cfg(test)]
 use self::flood::{
     FLOOD_BACKGROUND_MAX_CHARS, FLOOD_LINE_CHARS, FLOOD_LIVE_MAX, FLOOD_OVERFLOW_MAX_CHARS,
-    FLOOD_POOL_THRESHOLD, FLOOD_SUMMARY_SYSTEM, flood_summary_prompt, render_overflow_text,
-    resolve_flood_background, truncate_background,
+    FLOOD_POOL_THRESHOLD, render_overflow_text, truncate_background,
 };
 
 #[cfg(test)]

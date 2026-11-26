@@ -39,19 +39,20 @@ pub struct PromptMessage {
     pub received_at: i64,
 }
 
-/// Image descriptions produced by the gate for the current batch.
+/// The current batch's pictures, made visible to the agent herself.
 ///
-/// The agent never receives image bytes. The gate looks at every picture once and
-/// writes the result of that look here as text, so the agent reads a description instead
-/// of decoding pixels — cheaper, and it keeps image bytes out of the conversation.
+/// Each line names one picture: either an `@path` to a staged file she opens
+/// herself, or — for a sticker her library already holds — the stored
+/// description, so a picture she knows costs no second look.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptImages {
     /// One line per image, already ordered and referenced by `mN`.
     pub lines: Vec<String>,
     /// Images that could not be fetched, decoded or tagged.
     pub unavailable: usize,
-    /// Hashes of the pictures the model was shown this batch. It is the only set a
-    /// sticker op may name, so a model cannot reach the library by guessing.
+    /// Hashes of the sticker pictures resolved this batch: ones she was shown
+    /// plus ones already in her library. It is the only set a sticker op may
+    /// name, so a model cannot reach the library by guessing.
     pub sticker_hashes: Vec<String>,
     /// Per-stage loss counters for the audit trail. The prompt never sees
     /// these; they exist so an image incident is diagnosable after the fact
@@ -429,9 +430,9 @@ pub fn render(batch: &PromptBatch) -> String {
     if image_count > 0 {
         out.push_str("\n# 图片\n");
         if batch.images.lines.is_empty() {
-            out.push_str("这批图片没有拿到可用描述；不可根据占位符推测内容，也不要说它们模糊或看不清，就当没发过。\n");
+            out.push_str("这批图片没能取到文件；不可根据占位符推测内容，也不要说它们模糊或看不清，就当没发过。\n");
         } else {
-            out.push_str("图片已由前置识别为文字描述，你不需要也无法直接读图：\n");
+            out.push_str("每行末尾 @ 后面是图片文件路径，图就在那里，直接打开看：\n");
             for line in &batch.images.lines {
                 out.push_str("- ");
                 out.push_str(line);
@@ -440,14 +441,15 @@ pub fn render(batch: &PromptBatch) -> String {
         }
         if batch.images.unavailable > 0 {
             out.push_str(&format!(
-                "另有 {} 张图片未能识别：不要评价它们（不要说糊、暗、看不清），不要推断其内容，就当它们不存在。\n",
+                "另有 {} 张图片没能取到：不要评价它们（不要说糊、暗、看不清），不要推断其内容，就当它们不存在。\n",
                 batch.images.unavailable
             ));
         }
         if batch.images.lines.iter().any(|l| l.contains("表情 #")) {
             out.push_str(
                 "看到带「表情 #xxxxxxxx」的图时，用 call_mcp_tool 调 sticker_keep 决定收不收：\n\
-                 verdict 用 self 就是收进你的表情库（以后能发），用 ignore 就是以后不再问你这张。\n\
+                 verdict 用 self 就是收进你的表情库（以后能发），收的时候带上 description：你自己写的一句短描述（30 字内，写清画的是谁、什么表情动作、图里的文字），以后就靠它找这张。\n\
+                 用 ignore 就是以后不再问你这张。标了「库里已有」的已经在库里，不用再收。\n\
                  只收你自己喜欢、真的会拿来用的；不置可否就不调，它会先待在缓存里。\n",
             );
         }

@@ -74,21 +74,7 @@ pub(super) async fn list_groups(State(state): State<Arc<AdminState>>) -> ApiResu
             "conversation_turn_limit": crate::app::turn::turn_limit_value(
                 &state.conversation_turn_limit
             ),
-            // The gate scores how unfinished a burst looks; this is the longest it can
-            // ever hold one back. Shown so an operator reading a slow reply can tell
-            // "the gate was patient" from "the agent was slow".
-            "cadence_hold_max_seconds": crate::app::preflight::HOLD_MAX_SECONDS,
             "cadence_context_messages": crate::app::preflight::PREFLIGHT_CONTEXT_MESSAGES,
-            "preflight_session_id": crate::app::preflight::Preflight::session_id(
-                &group.bot_id,
-                &group.group_id,
-            ),
-            // The gate uses the base id plus a 24h bucket, so show what is actually in
-            // use rather than the stable prefix alone.
-            "aux_session_id": crate::integrations::aux_gateway::timestamped_session_id(
-                &crate::app::preflight::Preflight::session_id(&group.bot_id, &group.group_id),
-                crate::now_unix(),
-            ),
             "memory_scope": format!("{}:{}", group.bot_id, group.group_id),
             "memory_revision": group.memory_revision,
             "mood": mood.map(|m| json!({"label": m.label, "reason": m.reason})),

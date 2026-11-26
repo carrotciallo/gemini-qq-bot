@@ -6,13 +6,14 @@
 //!
 //! * **Enforceable**: Mihomo is spawned as a child process, binds only container
 //!   loopback ports, and is probed through its own API before a batch runs. When the
-//!   probe fails the batch is kept as pending and marked `waiting_for_us_proxy`.
+//!   probe fails the batch is kept as pending and marked `waiting_for_vps_proxy`.
 //! * **Not enforceable**: `HTTP_PROXY`/`HTTPS_PROXY` in the child environment are a
 //!   *convention*, not a sandbox. A CLI that ignores them will connect directly. This
 //!   module therefore never claims that package-level network isolation exists.
 //!
-//! The American-node rule is a liveness rule: if no US node is selected the proxy is
-//! considered unusable and no downgrade to another region is allowed.
+//! The pinned-VPS rule is a liveness rule: the egress is pinned to the self-hosted
+//! tokyo-1 VPS, so if the selected leaf is not one of its protocol nodes the proxy
+//! is considered unusable and no downgrade to another exit is allowed.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -36,8 +37,8 @@ pub struct ProxyHealth {
     pub process_running: bool,
     /// `GET /version` on the controller succeeded.
     pub api_ok: bool,
-    /// A US node is selected and reachable.
-    pub us_node_ok: bool,
+    /// The selected leaf is one of the pinned VPS nodes (see [`VPS_NODES`]).
+    pub vps_node_ok: bool,
     /// The name of the selected node, for the panel. Never a credential.
     pub selected_node: Option<String>,
     pub last_error: Option<String>,
@@ -53,13 +54,13 @@ impl ProxyHealth {
         if !mihomo_enabled {
             return true;
         }
-        self.process_running && self.api_ok && self.us_node_ok
+        self.process_running && self.api_ok && self.vps_node_ok
     }
 
     fn recompute(&mut self) {
         if !self.process_running {
             self.api_ok = false;
-            self.us_node_ok = false;
+            self.vps_node_ok = false;
         }
     }
 }
@@ -71,8 +72,8 @@ pub enum ProxyError {
     NotRunning,
     /// The controller API did not answer.
     ApiUnreachable,
-    /// No US node is selected.
-    NoUsNode,
+    /// The selected leaf is not one of the pinned VPS nodes.
+    NoPinnedNode,
     /// A node was selected but a latency test failed.
     NodeUnhealthy,
 }
@@ -82,45 +83,44 @@ impl ProxyError {
         match self {
             ProxyError::NotRunning => "not_running",
             ProxyError::ApiUnreachable => "api_unreachable",
-            ProxyError::NoUsNode => "no_us_node",
+            ProxyError::NoPinnedNode => "no_pinned_node",
             ProxyError::NodeUnhealthy => "node_unhealthy",
         }
     }
 }
 
-/// Node name matcher for the "must be an American node" rule.
-///
-/// Matching is name based, which is all the API exposes reliably. A name that mentions
-/// no recognisable region is **not** treated as American.
-pub fn is_us_node(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    const US: [&str; 8] = [
-        "us",
-        "usa",
-        "united states",
-        "america",
-        "american",
-        "洛杉矶",
-        "圣何塞",
-        "西雅图",
-    ];
-    const NON_US: [&str; 10] = [
-        "hk",
-        "香港",
-        "tw",
-        "台湾",
-        "sg",
-        "新加坡",
-        "jp",
-        "日本",
-        "kr",
-        "韩国",
-    ];
-    // An explicit non-US marker wins, so "US-HK" style labels are not misread.
-    if NON_US.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-    US.iter().any(|m| lower.contains(m))
+/// Node names of the pinned VPS egress: the self-hosted tokyo-1 VPS, one
+/// entry per protocol, plus the `-jp` variants that dial the same VPS
+/// through a commercial JP relay (dialer-proxy) for when the direct path
+/// is down, plus the CDN relay variant that reaches it through the
+/// Cloudflare edge. Whichever one is selected, the exit is the same VPS.
+pub const VPS_NODES: [&str; 7] = [
+    "tokyo-1",
+    "tokyo-1-reality",
+    "tokyo-1-tuic",
+    "tokyo-1-jp",
+    "tokyo-1-reality-jp",
+    "tokyo-1-tuic-jp",
+    "tokyo-1-cdn",
+];
+
+/// Whether `name` is one of the pinned VPS nodes. Exact match only: a group
+/// name such as US-AUTO must not pass, because the group *contains* the
+/// pinned nodes — it is not itself an exit.
+pub fn is_vps_node(name: &str) -> bool {
+    VPS_NODES.contains(&name)
+}
+
+/// Resolve the effective selection from a `/proxies` payload: GLOBAL's own
+/// selection plus, when that names a group, the group's selection — the
+/// actual exit leaf. A direct leaf has no `now` of its own and is kept.
+pub fn resolve_selection(body: &Value) -> (Option<String>, Vec<String>) {
+    let (selected, choices) = parse_selection(body, "GLOBAL");
+    let leaf = selected.as_deref().and_then(|group| {
+        let (now, _) = parse_selection(body, group);
+        now
+    });
+    (leaf.or(selected), choices)
 }
 
 /// Configuration for the child process.
@@ -285,12 +285,12 @@ impl Mihomo {
         let Ok(body) = resp.json().await else {
             return (None, Vec::new());
         };
-        parse_selection(&body, "GLOBAL")
+        resolve_selection(&body)
     }
 
     /// Probe the controller API and the selected node.
     ///
-    /// `proxies` supplies the selectable node names for the US check; tests inject it so
+    /// `proxies` supplies the selectable node names for the pinned-node check; tests inject it so
     /// no real proxy is needed.
     pub async fn probe_with(
         &self,
@@ -305,7 +305,7 @@ impl Mihomo {
         if !self.enabled {
             // Proxy disabled by the operator: no probe, no claim.
             health.api_ok = false;
-            health.us_node_ok = false;
+            health.vps_node_ok = false;
             *self.health.write().await = health.clone();
             return health;
         }
@@ -334,13 +334,13 @@ impl Mihomo {
         health.selected_node = selected.map(|s| s.to_string());
         match selected {
             None => {
-                health.last_error = Some(ProxyError::NoUsNode.as_str().to_string());
+                health.last_error = Some(ProxyError::NoPinnedNode.as_str().to_string());
             }
-            Some(node) if !is_us_node(node) => {
-                // No downgrade: a non-US node is a failure, not a fallback.
-                health.last_error = Some(ProxyError::NoUsNode.as_str().to_string());
+            Some(node) if !is_vps_node(node) => {
+                // No downgrade: a non-VPS leaf is a failure, not a fallback.
+                health.last_error = Some(ProxyError::NoPinnedNode.as_str().to_string());
             }
-            Some(_) => health.us_node_ok = true,
+            Some(_) => health.vps_node_ok = true,
         }
         *self.health.write().await = health.clone();
         health
@@ -398,17 +398,51 @@ mod tests {
     }
 
     #[test]
-    fn us_node_matching_is_conservative() {
-        for us in ["US-LosAngeles", "usa-01", "United States 3", "洛杉矶-02"] {
-            assert!(is_us_node(us), "{us} 应识别为美国节点");
+    fn vps_node_matching_is_exact() {
+        for vps in [
+            "tokyo-1",
+            "tokyo-1-reality",
+            "tokyo-1-tuic",
+            "tokyo-1-jp",
+            "tokyo-1-reality-jp",
+            "tokyo-1-tuic-jp",
+            "tokyo-1-cdn",
+        ] {
+            assert!(is_vps_node(vps), "{vps} 应识别为固定 VPS 节点");
         }
-        for other in ["HK-01", "香港 2", "SG-Premium", "JP-Tokyo", "kr-seoul"] {
-            assert!(!is_us_node(other), "{other} 不得被当成美国节点");
+        for other in [
+            "US-AUTO",
+            "US-LosAngeles",
+            "E-日本1",
+            "JP-Tokyo",
+            "tokyo-1-hy2",
+            "tokyo-2",
+        ] {
+            assert!(!is_vps_node(other), "{other} 不得被当成固定 VPS 节点");
         }
-        // An explicit non-US marker wins over a stray "us".
-        assert!(!is_us_node("US-HK-中转"));
-        // Unrecognisable names are not American.
-        assert!(!is_us_node("Node-7"));
+    }
+
+    #[test]
+    fn resolve_selection_descends_into_the_selected_group() {
+        let body = serde_json::json!({
+            "proxies": {
+                "GLOBAL": {"now": "US-AUTO", "all": ["US-AUTO", "DIRECT"]},
+                "US-AUTO": {"now": "tokyo-1-tuic", "all": ["tokyo-1", "tokyo-1-reality", "tokyo-1-tuic"]}
+            }
+        });
+        let (selected, _) = resolve_selection(&body);
+        assert_eq!(selected.as_deref(), Some("tokyo-1-tuic"));
+    }
+
+    #[test]
+    fn resolve_selection_keeps_a_direct_leaf() {
+        let body = serde_json::json!({
+            "proxies": {
+                "GLOBAL": {"now": "tokyo-1", "all": ["tokyo-1"]}
+            }
+        });
+        let (selected, _) = resolve_selection(&body);
+        assert_eq!(selected.as_deref(), Some("tokyo-1"));
     }
 
     #[test]
@@ -416,8 +450,8 @@ mod tests {
         let good = ProxyHealth {
             process_running: true,
             api_ok: true,
-            us_node_ok: true,
-            selected_node: Some("US-1".into()),
+            vps_node_ok: true,
+            selected_node: Some("tokyo-1".into()),
             last_error: None,
             restarts: 0,
         };
@@ -427,7 +461,7 @@ mod tests {
             match broken {
                 0 => h.process_running = false,
                 1 => h.api_ok = false,
-                _ => h.us_node_ok = false,
+                _ => h.vps_node_ok = false,
             }
             h.recompute();
             assert!(!h.ready(true), "缺少任一信号时不得调用 Agy");
@@ -465,15 +499,15 @@ mod tests {
     #[tokio::test]
     async fn disabled_proxy_never_probes_and_reports_no_health() {
         let mihomo = Mihomo::new(config(), false);
-        let health = mihomo.probe_with(Some("HK-01"), &[]).await;
+        let health = mihomo.probe_with(Some("E-日本1"), &[]).await;
         assert!(!health.api_ok);
-        assert!(!health.us_node_ok);
+        assert!(!health.vps_node_ok);
         // But the gate is open because the operator disabled the proxy.
         assert!(mihomo.ready().await);
     }
 
     #[tokio::test]
-    async fn non_us_node_blocks_the_gate() {
+    async fn non_vps_node_blocks_the_gate() {
         let mut cfg = config();
         // Point the API at a closed port so the probe stops at the API check; we assert
         // the node rule through the pure helper instead.
@@ -481,9 +515,9 @@ mod tests {
         let mihomo = Mihomo::new(cfg, true);
         mihomo.start().await.ok();
         let health = mihomo
-            .probe_with(Some("HK-01"), &["HK-01".to_string()])
+            .probe_with(Some("E-日本1"), &["E-日本1".to_string()])
             .await;
-        assert!(!health.us_node_ok);
+        assert!(!health.vps_node_ok);
         assert!(!mihomo.ready().await);
         mihomo.stop().await;
     }

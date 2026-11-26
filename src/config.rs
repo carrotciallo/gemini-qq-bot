@@ -15,19 +15,6 @@ use crate::error::{BotError, BotResult};
 
 /// Default internal admin API bind address (inside the container).
 pub const DEFAULT_ADMIN_BIND: &str = "0.0.0.0:8080";
-/// Default Aux gateway base url.
-pub const DEFAULT_AUX_BASE_URL: &str = "http://host.docker.internal:18088";
-/// The only model the group bot may use for preflight, folding and vision.
-///
-/// `hy3` is free at the gateway (credit 0.0), reads images, and passed all three
-/// jobs: cadence verdicts, memory folding, and image tagging. There is no fallback
-/// and no other permitted value: a config that names something else refuses to
-/// start rather than silently costing money.
-pub const DEFAULT_AUX_MODEL: &str = "hy3";
-/// Default name of the gateway's sticky-session header (see
-/// `integrations::aux_gateway`). Configurable because the name is part of
-/// the gateway's own protocol, not of this client.
-pub const DEFAULT_AUX_SESSION_HEADER: &str = "X-Aux-Session";
 /// Default Agy model id (unverified against the real CLI, see README).
 pub const DEFAULT_AGY_MODEL: &str = "gemini-3.8-flash";
 /// Default Agy binary path inside the bot container.
@@ -266,8 +253,6 @@ pub struct Config {
     pub admin_bind: String,
     pub admin_token: String,
     pub db_path: PathBuf,
-    pub aux_base_url: String,
-    pub aux_api_key_file: PathBuf,
     /// Built web console directory (`WEB_DIST`). When set and populated,
     /// the admin listener also serves the console under `/console/`.
     pub web_dist: Option<PathBuf>,
@@ -275,9 +260,6 @@ pub struct Config {
     pub event_webhook_url: Option<String>,
     /// HMAC secret for webhook signatures (`EVENT_WEBHOOK_SECRET`).
     pub event_webhook_secret: Option<String>,
-    pub aux_model: String,
-    pub aux_enabled: bool,
-    pub aux_session_header: String,
     pub media_origins: Vec<String>,
     pub media_max_bytes: u64,
     pub media_max_pixels: u64,
@@ -401,28 +383,6 @@ impl Config {
         let event_webhook_url = env("EVENT_WEBHOOK_URL");
         let event_webhook_secret = env("EVENT_WEBHOOK_SECRET");
 
-        let aux_base_url = env("AUX_BASE_URL").unwrap_or_else(|| DEFAULT_AUX_BASE_URL.to_string());
-        if !aux_base_url.starts_with("http://") && !aux_base_url.starts_with("https://") {
-            return Err(BotError::Config("AUX_BASE_URL 必须是 http(s) URL".into()));
-        }
-        let aux_api_key_file = PathBuf::from(
-            env("AUX_API_KEY_FILE").unwrap_or_else(|| "/run/secrets/aux_api_key".to_string()),
-        );
-        let aux_model = env("AUX_MODEL").unwrap_or_else(|| DEFAULT_AUX_MODEL.to_string());
-        let aux_enabled = env("AUX_ENABLED")
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-
-        let aux_session_header = env("AUX_SESSION_HEADER")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_AUX_SESSION_HEADER.to_string());
-
         let media_origins = match env("SNOWLUMA_MEDIA_ORIGINS") {
             Some(raw) => raw
                 .split(',')
@@ -512,11 +472,6 @@ impl Config {
             web_dist,
             event_webhook_url,
             event_webhook_secret,
-            aux_base_url,
-            aux_api_key_file,
-            aux_model,
-            aux_enabled,
-            aux_session_header,
             media_origins,
             media_max_bytes,
             media_max_pixels,
@@ -725,33 +680,10 @@ mod tests {
     }
 
     #[test]
-    fn aux_disabled_by_default() {
-        let cfg = build(&base()).expect("配置应当有效");
-        assert!(!cfg.aux_enabled);
-        assert_eq!(cfg.aux_model, DEFAULT_AUX_MODEL);
-        assert_eq!(cfg.aux_base_url, DEFAULT_AUX_BASE_URL);
-        assert_eq!(cfg.aux_session_header, DEFAULT_AUX_SESSION_HEADER);
-    }
-
-    #[test]
     fn switches_default_to_on() {
         let file = FileConfig::default();
         assert!(file.session_rotation_enabled);
         assert!(file.quota_degradation_enabled);
-    }
-
-    #[test]
-    fn accepts_a_custom_aux_model_and_session_header() {
-        // The model is an ordinary setting since the aux rename: any
-        // non-empty name the gateway publishes is accepted (the default
-        // stays hy3), and the sticky-session header name follows the
-        // gateway's protocol via AUX_SESSION_HEADER.
-        let mut vars = base();
-        vars.push(("AUX_MODEL", "some-other-model"));
-        vars.push(("AUX_SESSION_HEADER", "X-Legacy-Session"));
-        let cfg = build(&vars).expect("配置应当有效");
-        assert_eq!(cfg.aux_model, "some-other-model");
-        assert_eq!(cfg.aux_session_header, "X-Legacy-Session");
     }
 
     #[test]

@@ -30,11 +30,10 @@ use crate::admin::routes::{AdminState, router as admin_router};
 use crate::agent::agy::AgyPermissions;
 use crate::config::Config;
 use crate::error::{BotError, BotResult};
-use crate::health::{AgyHealth, HealthRegistry, HealthSnapshot, OneBotHealth, OwnerStatus};
+use crate::health::{
+    AgyHealth, AuxStatus, HealthRegistry, HealthSnapshot, OneBotHealth, OwnerStatus,
+};
 use crate::integrations::agy_aux::{AgyAuxClient, AgyAuxConfig};
-use crate::integrations::aux_gateway::{AuxGatewayConfig, AuxGatewayStatus};
-use crate::integrations::aux_llm::AuxLlm;
-use crate::integrations::aux_slot::{AgyAuxParams, AuxSlot, build_provider};
 use crate::integrations::quota::{QuotaConfig, QuotaService};
 use crate::memory::chunker::{FoldOutcome, FoldSkip};
 use crate::memory::compaction::{CompactionScheduler, CompactionThresholds, SummaryModel};
@@ -47,7 +46,7 @@ use crate::process::mihomo::{Mihomo, MihomoConfig};
 use crate::state::memory::MemoryApplier;
 use crate::store::SqliteStore;
 
-use runtime_settings::{RuntimeSettings, SettingsOverlay, effective_aux_config};
+use runtime_settings::{RuntimeSettings, SettingsOverlay};
 
 pub use intake::{Intake, IntakeLimits, IntakeOutcome};
 pub use turn::{TurnExecutor, TurnResult};
@@ -70,13 +69,11 @@ pub struct App {
     pub store: Arc<SqliteStore>,
     pub health: Arc<HealthRegistry>,
     pub mihomo: Arc<Mihomo>,
-    pub aux: Arc<dyn AuxLlm>,
-    /// The swappable provider behind `aux` (the chat-side face): the
-    /// settings API replaces the backend inside the slot at runtime.
-    /// Memory work no longer rides this slot (memfix [mf-2]).
-    pub aux_slot: Arc<AuxSlot>,
     /// The memory-judgement backend (compaction, folds, consolidation,
     /// digest, handover): one dedicated Agy session, fixed at startup.
+    /// Kept concrete (not only as the `summary_model` trait object) so
+    /// health reporting and the spontaneous gate can read its liveness.
+    pub memory_aux: Arc<AgyAuxClient>,
     pub summary_model: Arc<dyn crate::memory::compaction::SummaryModel>,
     /// Runtime settings (overlay plus the live handles it steers).
     pub settings: Arc<RuntimeSettings>,
@@ -166,35 +163,20 @@ impl App {
             .parent()
             .map(|dir| dir.join("runtime-settings.json"));
         let settings_overlay = SettingsOverlay::load(settings_path.as_deref());
-        let aux_base_config = AuxGatewayConfig::from_config(&config);
-        let aux_config = effective_aux_config(&aux_base_config, &settings_overlay);
-        let agy_aux_params = AgyAuxParams {
+        // Memory judgement runs on its own dedicated Agy session (memfix
+        // [mf-2]): summaries, folds and consolidation run on the same mind
+        // that holds the memories. Since the 2026-11-24 gateway teardown
+        // this is the only aux there is — the chat-side gateway slot, its
+        // runtime swap and its settings surface are all gone.
+        let memory_aux = Arc::new(AgyAuxClient::new(AgyAuxConfig {
             bin: config.agy_bin.clone(),
             home: config.agy_home.clone(),
-            workspace: config.agy_projects_dir.join("__aux__"),
+            workspace: config.agy_projects_dir.join("__memory__"),
             model: config.agy_model.clone(),
             turn_limit: config.file.conversation_turn_limit.max(1),
-        };
-        // The aux layer always has exactly one provider (operator's
-        // dual-mode design): the gateway when it is enabled, otherwise one
-        // dedicated Agy session. There is no third, unprovisioned state.
-        // The slot lets the settings API swap the provider at runtime.
-        // It backs the chat-side AuxLlm face only.
-        let aux_slot = Arc::new(AuxSlot::new(build_provider(aux_config, &agy_aux_params)));
-        let aux = Arc::clone(&aux_slot) as Arc<dyn AuxLlm>;
-        // Memory judgement runs on its own dedicated Agy session (memfix
-        // [mf-2]): summaries, folds and consolidation moved off the aux
-        // gateway entirely — the same mind that holds the memories
-        // maintains them. The workspace is separate from the aux
-        // fallback's `__aux__` so a runtime aux swap can never put two
-        // resident sessions on one workspace.
-        let summary_model = Arc::new(AgyAuxClient::new(AgyAuxConfig {
-            bin: agy_aux_params.bin.clone(),
-            home: agy_aux_params.home.clone(),
-            workspace: config.agy_projects_dir.join("__memory__"),
-            model: agy_aux_params.model.clone(),
-            turn_limit: agy_aux_params.turn_limit,
-        })) as Arc<dyn crate::memory::compaction::SummaryModel>;
+        }));
+        let summary_model =
+            Arc::clone(&memory_aux) as Arc<dyn crate::memory::compaction::SummaryModel>;
 
         // Panel quota card: reads the Agy account's Gemini buckets. It talks
         // to Google directly, so it rides the same Mihomo proxy the agent
@@ -215,7 +197,7 @@ impl App {
             proxy: None,
             proxy_enabled: config.mihomo_enabled,
             agy: Some(agy_health),
-            aux: Some(aux_slot.status_cached().await),
+            aux: Some(AuxStatus::agy_mode(memory_aux.healthy().await)),
             owner: OwnerStatus {
                 configured: !config.owner_qq_id.is_empty(),
             },
@@ -311,20 +293,12 @@ impl App {
             )
             .with_digest(Arc::clone(&digest))
             .with_pacing(Arc::clone(&pacing))
-            .with_aux(Arc::clone(&aux))
             .with_call_names(config.file.bot_call_names.clone())
             .with_resident(Arc::clone(&resident))
             .with_connection(connection.clone())
             .with_running_turns(Arc::clone(&running_turns))
             .with_previous_batch(Arc::clone(&previous_batch)),
         );
-
-        // The gate always exists: the aux layer always has a provider
-        // (gateway or the agy session), and the gate fails open when the
-        // provider errors, whichever one it is.
-        let preflight = Some(Arc::new(crate::app::preflight::Preflight::new(Arc::clone(
-            &aux,
-        ))));
 
         let resident_limits = turn::ResidentLimits {
             quiet_s: config.file.resident_quiet_s,
@@ -348,9 +322,6 @@ impl App {
         let settings = RuntimeSettings::new(
             settings_path,
             settings_overlay,
-            aux_base_config,
-            agy_aux_params,
-            Arc::clone(&aux_slot),
             Arc::clone(&pacing),
             Arc::clone(&rotation_limit),
             rotation_cap,
@@ -393,12 +364,6 @@ impl App {
             )?),
             media_max_bytes: config.media_max_bytes,
             media_max_pixels: config.media_max_pixels,
-            // The image path talks to the same gate, reached through the trait so a
-            // test can substitute a canned describer without a network call.
-            image_describer: preflight
-                .clone()
-                .map(|gate| gate as Arc<dyn crate::app::preflight::ImageDescriber>),
-            preflight,
             hourly_call_budget: config.file.hourly_call_budget,
             sticker_dir: config.sticker_dir.clone(),
             imagegen_dir: config.imagegen_dir.clone(),
@@ -406,10 +371,7 @@ impl App {
             // Loaded once here rather than at send time: a missing file is normal in
             // tests, so it simply contributes nothing.
             secrets: {
-                let mut secrets = vec![config.admin_token.clone()];
-                if let Ok(key) = std::fs::read_to_string(&config.aux_api_key_file) {
-                    secrets.push(key.trim().to_string());
-                }
+                let secrets = vec![config.admin_token.clone()];
                 secrets
                     .into_iter()
                     .filter(|value| !value.is_empty())
@@ -433,8 +395,7 @@ impl App {
             store,
             health,
             mihomo,
-            aux,
-            aux_slot,
+            memory_aux,
             summary_model,
             settings,
             rotation_limit,
@@ -448,11 +409,10 @@ impl App {
         })
     }
 
-    /// The aux row of the health snapshot, from whichever backend the
-    /// mode selected: probed gateway status, or the agy session's
-    /// liveness.
-    async fn aux_status_snapshot(&self) -> AuxGatewayStatus {
-        self.aux_slot.status_probed().await
+    /// The aux row of the health snapshot: the memory session's
+    /// current liveness.
+    async fn aux_status_snapshot(&self) -> AuxStatus {
+        AuxStatus::agy_mode(self.memory_aux.healthy().await)
     }
     /// Admin router, ready to serve (bearer auth already applied).
     pub fn admin_router(&self) -> Router {
@@ -591,10 +551,7 @@ impl App {
                 std::collections::HashSet::new();
             loop {
                 tokio::time::sleep(TICK_INTERVAL).await;
-                let jobs = flush_self
-                    .intake
-                    .flush_tick(crate::now_unix(), flush_self.executor.preflight.as_deref())
-                    .await;
+                let jobs = flush_self.intake.flush_tick(crate::now_unix()).await;
                 for job in jobs {
                     let executor = Arc::clone(&flush_self.executor);
                     let group_id = job.group_id.clone();
@@ -866,7 +823,7 @@ impl App {
             );
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                if !spot_self.aux.healthy().await {
+                if !spot_self.memory_aux.healthy().await {
                     continue;
                 }
                 let groups = spot_self

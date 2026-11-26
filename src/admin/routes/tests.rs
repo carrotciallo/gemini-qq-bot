@@ -81,6 +81,18 @@ fn new_memory_schema_requires_content_and_kind() {
 
 /// A state wired to `store`, with the quota client pointed at paths that do
 /// not exist so nothing in these tests touches the network or the real home.
+/// A SummaryModel that answers with an empty object: admin route tests
+/// never exercise real compaction, they only need the trait object.
+#[derive(Debug)]
+struct StubSummary;
+
+#[async_trait::async_trait]
+impl crate::memory::compaction::SummaryModel for StubSummary {
+    async fn summarise(&self, _prompt: String) -> Result<String, crate::error::ErrorClass> {
+        Ok("{}".to_string())
+    }
+}
+
 fn state_for(dir: &tempfile::TempDir, store: Arc<SqliteStore>) -> Arc<AdminState> {
     state_for_resident(dir, store, None)
 }
@@ -115,14 +127,7 @@ fn state_for_resident(
             Arc::clone(&store),
             crate::memory::compaction::CompactionThresholds::default(),
         )),
-        summary_model: Arc::new(AuxGatewayClient::new(
-            crate::integrations::aux_gateway::AuxGatewayConfig::new(
-                None,
-                None,
-                dir.path().join("absent-key"),
-                false,
-            ),
-        )),
+        summary_model: Arc::new(StubSummary),
         quota,
         settings: crate::app::runtime_settings::RuntimeSettings::for_tests(
             dir.path().to_path_buf(),
@@ -334,7 +339,7 @@ async fn api_v1_mount_serves_the_shared_handlers() {
 }
 
 #[tokio::test]
-async fn settings_round_trip_updates_aux_and_switches() {
+async fn settings_round_trip_updates_switches() {
     let dir = tempfile::tempdir().expect("tmp");
     let pool = crate::store::migrations::open_and_migrate(&dir.path().join("bot.sqlite3"))
         .await
@@ -342,37 +347,11 @@ async fn settings_round_trip_updates_aux_and_switches() {
     let store = Arc::new(SqliteStore::new(pool));
     let state = state_for(&dir, store);
 
-    // Starts in agy mode (fixture gateway disabled), both switches on.
+    // Both switches start on; the aux section is gone with the gateway.
     let body = get_json(Arc::clone(&state), "/api/v1/settings").await;
-    assert_eq!(body["aux"]["mode"], json!("agy"));
-    assert_eq!(body["aux"]["enabled"], json!(false));
+    assert!(body.get("aux").is_none());
     assert_eq!(body["runtime"]["session_rotation_enabled"], json!(true));
     assert_eq!(body["runtime"]["quota_degradation_enabled"], json!(true));
-
-    // Aux update: values land, the key is stored but never echoed.
-    let (status, body) = put_json(
-        Arc::clone(&state),
-        "/api/v1/settings/aux",
-        json!({"base_url": "http://127.0.0.1:18088", "model": "m1", "api_key": "k-secret"}),
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert_eq!(body["aux"]["base_url"], json!("http://127.0.0.1:18088"));
-    assert_eq!(body["aux"]["model"], json!("m1"));
-    assert_eq!(body["aux"]["api_key_set"], json!(true));
-    assert!(
-        !body.to_string().contains("k-secret"),
-        "api key must never be echoed"
-    );
-
-    // A malformed base URL is rejected and changes nothing.
-    let (status, _) = put_json(
-        Arc::clone(&state),
-        "/api/v1/settings/aux",
-        json!({"base_url": "notaurl"}),
-    )
-    .await;
-    assert_eq!(status, 400);
 
     // Switches flip live and persist to the overlay file.
     let (status, body) = put_json(
@@ -394,15 +373,6 @@ async fn settings_round_trip_updates_aux_and_switches() {
     // An empty switch update is a client error.
     let (status, _) = put_json(Arc::clone(&state), "/api/v1/settings/runtime", json!({})).await;
     assert_eq!(status, 400);
-
-    // Settings routes do not exist on the legacy mount.
-    let (status, _) = put_json(
-        state,
-        "/internal/v1/settings/runtime",
-        json!({"quota_degradation_enabled": true}),
-    )
-    .await;
-    assert_eq!(status, 404);
 }
 
 #[tokio::test]

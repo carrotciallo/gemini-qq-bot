@@ -19,6 +19,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorClass;
+use crate::memory::extract::json_span;
 use crate::store::{CompactionJob, JobState, MemoryRecord, SqliteStore};
 
 /// Trigger thresholds.
@@ -543,16 +544,8 @@ pub fn validate_summary_v2(
         // imperatives and closed rows are statements, and their bigram
         // overlap bands for resurrections vs legitimate follow-ups
         // overlap, so no threshold separates them.
-        let alias = open_loop.alias.trim();
-        let slot = open_loop.slot.trim();
-        if !alias.is_empty() {
-            let alias_stones: Vec<&Tombstone> =
-                tombstones.iter().filter(|t| t.alias == alias).collect();
-            if !alias_stones.is_empty()
-                && (slot.is_empty() || alias_stones.iter().any(|t| t.slot == slot))
-            {
-                return Err(SummaryError::Tombstoned);
-            }
+        if loop_resurrects_closed(open_loop, tombstones) {
+            return Err(SummaryError::Tombstoned);
         }
     }
     let canonical = serde_json::to_string(&summary).map_err(|_| SummaryError::Malformed)?;
@@ -560,6 +553,43 @@ pub fn validate_summary_v2(
         summary_text: canonical,
         source_revision: expected_revision,
     })
+}
+
+/// Whether one open loop re-declares a closed claim: it carries an alias
+/// that has closed rows and either omits the slot or names one of the
+/// closed slots. The validator's resurrection guard and the runner's
+/// salvage share this one predicate so they can never disagree.
+fn loop_resurrects_closed(open_loop: &OpenLoop, tombstones: &[Tombstone]) -> bool {
+    let alias = open_loop.alias.trim();
+    if alias.is_empty() {
+        return false;
+    }
+    let slot = open_loop.slot.trim();
+    let alias_stones: Vec<&Tombstone> = tombstones.iter().filter(|t| t.alias == alias).collect();
+    !alias_stones.is_empty() && (slot.is_empty() || alias_stones.iter().any(|t| t.slot == slot))
+}
+
+/// Remove every open loop that re-declares a closed claim, returning the
+/// dropped (alias, slot) pairs. The runner's salvage uses it: the rest of
+/// the summary validated, so forgetting the resurrected loops (this
+/// module's failure direction) beats discarding the whole compaction.
+fn drop_tombstoned_loops(
+    summary: &mut StructuredSummary,
+    tombstones: &[Tombstone],
+) -> Vec<(String, String)> {
+    let mut dropped = Vec::new();
+    summary.open_loops.retain(|open_loop| {
+        if loop_resurrects_closed(open_loop, tombstones) {
+            dropped.push((
+                open_loop.alias.trim().to_string(),
+                open_loop.slot.trim().to_string(),
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    dropped
 }
 
 /// Resolve tombstone rows to prompt entries: subjects reuse the request's
@@ -679,7 +709,7 @@ impl CompactionScheduler {
             store,
             thresholds,
             busy: Arc::new(tokio::sync::Mutex::new(())),
-            summary_model_label: crate::config::DEFAULT_AUX_MODEL.to_string(),
+            summary_model_label: crate::config::DEFAULT_AGY_MODEL.to_string(),
         }
     }
 
@@ -827,24 +857,61 @@ impl CompactionScheduler {
         // A v1-shaped answer goes through the strict structured validator; the
         // legacy free-text shape stays readable for one release so a mixed
         // fleet never hard-fails a job over format alone.
-        let structured = serde_json::from_str::<serde_json::Value>(&raw)
+        //
+        // The reply is sliced to its JSON object first (the shared
+        // extract::json_span, same as consolidation and digest): the model
+        // fences or wraps its JSON often enough that judging the wrapper
+        // instead of the content failed every production job from
+        // 2026-11-19 to 2026-11-22 while the objects inside were valid.
+        let candidate = json_span(&raw).unwrap_or(raw.trim());
+        let structured = serde_json::from_str::<serde_json::Value>(candidate)
             .ok()
             .and_then(|v| {
                 v.as_object()
                     .map(|obj| obj.contains_key("group_profile") || obj.contains_key("members"))
             })
             .unwrap_or(false);
-        let outcome = if structured {
+        let mut outcome = if structured {
             validate_summary_v2(
-                &raw,
+                candidate,
                 job.source_revision,
                 &valid_aliases,
                 &request.tombstones,
                 &request.sealed_topics,
             )
         } else {
-            validate_summary(&raw, job.source_revision)
+            validate_summary(candidate, job.source_revision)
         };
+        // Salvage a tombstone refusal (2026-11-24): the model keeps
+        // re-declaring a group's long-closed loops, and one resurrected
+        // loop used to sink an otherwise valid summary — one group sat
+        // uncompacted for days on exactly this. Drop just the offending
+        // loops and judge the rest; the validator itself stays strict,
+        // and the drop is logged below with the pairs it removed.
+        if structured && matches!(outcome, Err(SummaryError::Tombstoned)) {
+            if let Ok(mut summary) = serde_json::from_str::<StructuredSummary>(candidate) {
+                let dropped = drop_tombstoned_loops(&mut summary, &request.tombstones);
+                if !dropped.is_empty() {
+                    if let Ok(resliced) = serde_json::to_string(&summary) {
+                        let retry = validate_summary_v2(
+                            &resliced,
+                            job.source_revision,
+                            &valid_aliases,
+                            &request.tombstones,
+                            &request.sealed_topics,
+                        );
+                        if retry.is_ok() {
+                            tracing::warn!(
+                                group_id = job.group_id,
+                                dropped = ?dropped,
+                                "记忆压缩剔除已结案 loop 后通过校验"
+                            );
+                        }
+                        outcome = retry;
+                    }
+                }
+            }
+        }
         match outcome {
             Ok(validated) => {
                 let _ = self
@@ -874,6 +941,9 @@ impl CompactionScheduler {
                 // session DB only keeps the model's final text, so when
                 // the client settled early this excerpt is the only
                 // surviving evidence of what was actually validated.
+                // The full text is logged too (2026-11-23): head/tail
+                // excerpts alone left the 2026-11-19..22 failure streak
+                // impossible to pin to the failing field.
                 tracing::warn!(
                     group_id = job.group_id,
                     error = e.as_str(),
@@ -883,6 +953,7 @@ impl CompactionScheduler {
                         .chars()
                         .skip(raw.chars().count().saturating_sub(40))
                         .collect::<String>(),
+                    raw_full = raw.as_str(),
                     "记忆压缩回复未过校验"
                 );
                 let _ = self
@@ -1012,6 +1083,53 @@ mod tests {
         let valid: Vec<String> = aliases.iter().map(|(_, a)| a.clone()).collect();
         let raw = r#"{"v":1,"group_profile":"咖啡爱好者小群","members":[{"alias":"u1","facts":["喜欢手冲咖啡"]}],"active_topics":[],"open_loops":[],"source_revision":7}"#;
         assert!(validate_summary_v2(raw, 7, &valid, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn fenced_summary_validates_after_slicing() {
+        // Production replies arrive fenced (2026-11-19..22: jobs failed
+        // `malformed` on the wrapper alone). run_job slices the reply
+        // with json_span before validating; pin that the sliced forms of
+        // a valid reply pass the strict validator.
+        let inner = r#"{"v":2,"group_profile":"本群常聊咖啡与手办，气氛温和。","members":[{"alias":"u1","facts":["爱喝手冲咖啡"]}],"active_topics":[],"open_loops":[],"source_revision":7}"#;
+        for raw in [format!("```json\n{inner}\n```"), format!("{inner}\n```")] {
+            let candidate = json_span(&raw).expect("应切出对象");
+            assert!(
+                validate_summary_v2(candidate, 7, &["u1".to_string()], &[], &[]).is_ok(),
+                "fenced reply should validate after slicing: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn salvage_drops_only_tombstoned_loops_and_revalidates() {
+        // the production stall: a valid summary whose open loops re-declare
+        // closed claims (one by exact slot, one by omitting it). The
+        // strict validator refuses the whole reply; the runner's salvage
+        // drops exactly those loops and the remainder must pass.
+        let stones = [Tombstone {
+            alias: "群".to_string(),
+            slot: "刷本计划".to_string(),
+            content: "每周六刷金狮子（已取消）".to_string(),
+        }];
+        let raw = r#"{"v":2,"group_profile":"本群常聊咖啡与手办，气氛温和。","members":[{"alias":"u1","facts":["爱喝手冲咖啡"]}],"active_topics":[],"open_loops":[{"text":"等50级带人刷本","due":null,"alias":"群","slot":"刷本计划"},{"text":"那件事后来怎样了","due":null,"alias":"群","slot":""},{"text":"周五拼单买豆子","due":null,"alias":"u1","slot":"拼单"}],"source_revision":7}"#;
+        assert_eq!(
+            validate_summary_v2(raw, 7, &["u1".to_string()], &stones, &[]).unwrap_err(),
+            SummaryError::Tombstoned
+        );
+        let mut summary: StructuredSummary = serde_json::from_str(raw).expect("应可解析");
+        let dropped = drop_tombstoned_loops(&mut summary, &stones);
+        assert_eq!(
+            dropped,
+            vec![
+                ("群".to_string(), "刷本计划".to_string()),
+                ("群".to_string(), "".to_string()),
+            ]
+        );
+        assert_eq!(summary.open_loops.len(), 1);
+        assert_eq!(summary.open_loops[0].slot, "拼单");
+        let resliced = serde_json::to_string(&summary).expect("应可序列化");
+        assert!(validate_summary_v2(&resliced, 7, &["u1".to_string()], &stones, &[]).is_ok());
     }
 
     #[test]
